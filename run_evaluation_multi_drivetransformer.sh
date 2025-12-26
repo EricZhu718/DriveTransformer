@@ -9,6 +9,7 @@ PLANNER_TYPE=only_traj
 ALGO=DriveTransformer
 SAVE_PATH=./eval_bench2drive220_${ALGO}_${PLANNER_TYPE}
 
+export PYTHONPATH="/zfsauton2/home/ezhu3/Bench2Drive/DriveTransformer:${PYTHONPATH}"
 
 if [ ! -d "${ALGO}_b2d_${PLANNER_TYPE}" ]; then
     mkdir ${ALGO}_b2d_${PLANNER_TYPE}
@@ -21,7 +22,7 @@ fi
 if [ ! -f "${BASE_ROUTES}_${ALGO}_${PLANNER_TYPE}_split_done.flag" ]; then
     echo -e "****************************\033[33m Attention \033[0m ****************************"
     echo -e "\033[33m Running split_xml.py \033[0m"
-    TASK_NUM=8
+    TASK_NUM=4
     python tools/split_xml.py $BASE_ROUTES $TASK_NUM $ALGO $PLANNER_TYPE
     touch "${BASE_ROUTES}_${ALGO}_${PLANNER_TYPE}_split_done.flag"
     echo -e "\033[32m Splitting complete. Flag file created. \033[0m"
@@ -29,9 +30,21 @@ else
     echo -e "\033[32m Splitting already done. \033[0m"
 fi
 
+# ============================================================================
+# MODIFICATION: Set empty DISPLAY for headless operation (requires -opengl flag in CARLA)
+# ============================================================================
+export DISPLAY=
+echo -e "\033[32m DISPLAY set to empty (headless mode) \033[0m"
+echo -e "\033[33m Note: This requires CARLA to be started with -opengl flag \033[0m"
+# ============================================================================
+# END MODIFICATION
+# ============================================================================
+
 echo -e "**************\033[36m Please Manually adjust GPU or TASK_ID \033[0m **************"
-GPU_RANK_LIST=(0 1 2 3 4 5 6 7)
-TASK_LIST=(0 1 2 3 4 5 6 7)
+# GPU_RANK_LIST=(0 1 2 3 4 5 6 7)
+# TASK_LIST=(0 1 2 3 4 5 6 7)
+GPU_RANK_LIST=(0 1 2 3)
+TASK_LIST=(0 1 2 3)
 echo -e "\033[32m GPU_RANK_LIST: $GPU_RANK_LIST \033[0m"
 echo -e "\033[32m TASK_LIST: $TASK_LIST \033[0m"
 echo -e "***********************************************************************************"
@@ -52,7 +65,15 @@ for ((i=0; i<$length; i++ )); do
     echo -e "\033[32m GPU_RANK: $GPU_RANK \033[0m"
     echo -e "\033[32m bash leaderboard/scripts/run_evaluation.sh $PORT $TM_PORT $IS_BENCH2DRIVE $ROUTES $TEAM_AGENT $TEAM_CONFIG $CHECKPOINT_ENDPOINT $SAVE_PATH $PLANNER_TYPE $GPU_RANK \033[0m"
     echo -e "***********************************************************************************"
-    bash -e leaderboard/scripts/run_evaluation.sh $PORT $TM_PORT $IS_BENCH2DRIVE $ROUTES $TEAM_AGENT $TEAM_CONFIG $CHECKPOINT_ENDPOINT $SAVE_PATH $PLANNER_TYPE $GPU_RANK 2>&1 > ${BASE_ROUTES}_${TASK_LIST[$i]}_${ALGO}_${PLANNER_TYPE}.log &
-    sleep 5
+    # ============================================================================
+    # MODIFICATION: Explicitly set DISPLAY= for each task
+    # ============================================================================
+    DISPLAY= bash -e leaderboard/scripts/run_evaluation_original.sh $PORT $TM_PORT $IS_BENCH2DRIVE $ROUTES $TEAM_AGENT $TEAM_CONFIG $CHECKPOINT_ENDPOINT $SAVE_PATH $PLANNER_TYPE $GPU_RANK 2>&1 > ${BASE_ROUTES}_${TASK_LIST[$i]}_${ALGO}_${PLANNER_TYPE}.log &
+    # ============================================================================
+    # END MODIFICATION
+    # ============================================================================
+    # source leaderboard/scripts/run_evaluation_original.sh $PORT $TM_PORT $IS_BENCH2DRIVE $ROUTES $TEAM_AGENT $TEAM_CONFIG $CHECKPOINT_ENDPOINT $SAVE_PATH $PLANNER_TYPE $GPU_RANK
+
+    sleep 20
 done
 wait

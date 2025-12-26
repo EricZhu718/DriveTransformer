@@ -26,8 +26,13 @@ from mmcv.parallel.collate import collate as  mm_collate_to_batch_form
 from mmcv.core.bbox import get_box_type
 from team_code.planner import RoutePlanner
 from pyquaternion import Quaternion
+from torch.cuda.amp import autocast
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.patches import Circle
 
-SAVE_PATH = None #os.environ.get('SAVE_PATH', None)
+SAVE_PATH = "Drivetransformer_Logs" #os.environ.get('SAVE_PATH', None)
 IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
 
 
@@ -101,6 +106,16 @@ class DriveTransformerAgent(autonomous_agent.AutonomousAgent):
         self.prev_control_cache = []
         self.prev_control_list = []
         self.step_time_avg = []
+        
+        # Agent tracking in ego coordinates
+        self.tracked_agents = {}  # dict: agent_id -> {'positions': [(step, x_ego, y_ego, ego_pose)], 'world_positions': [(step, x_world, y_world)], 'last_seen': step}
+        self.next_agent_id = 0
+        self.tracking_max_distance = 3.0  # meters - max distance to associate detections across frames
+        self.tracking_max_age = 20  # frames - remove tracks not seen for this many frames
+        self.ego_pose_history = {}  # dict: step -> ego_pose (for transforming historical positions)
+        
+        # Forecasting method: 'moving_average' or 'linear_fit'
+        self.forecast_method = 'moving_average'  # Change this to switch methods
         if SAVE_PATH is not None:
             now = datetime.datetime.now()
             string = pathlib.Path(os.environ['ROUTES']).stem + '_'
@@ -285,10 +300,8 @@ class DriveTransformerAgent(autonomous_agent.AutonomousAgent):
                         'width': 512, 'height': 512, 'fov': 5 * 10.0,
                         'id': 'bev'
                     }
-                
         }
    
-
     def _init(self):
         # get gps reference point
         try:
@@ -439,7 +452,9 @@ class DriveTransformerAgent(autonomous_agent.AutonomousAgent):
         current_pose = lidar2global
         current_pose_inv = self.invert_pose(current_pose)
         results['ego_pose'] = current_pose
-        results['ego_pose_inv'] = current_pose_inv   
+        results['ego_pose_inv'] = current_pose_inv
+        # Store current ego pose for agent tracking transformations
+        self.ego_pose_history[self.step] = current_pose.copy()   
         # ego past trajectory
         past_pose_1 = self.past_ego_pos_cache[-10] if len(self.past_ego_pos_cache) >= 10 else lidar2global
         past_pose_2 = self.past_ego_pos_cache[0] if len(self.past_ego_pos_cache) == 20 else lidar2global   
@@ -476,14 +491,250 @@ class DriveTransformerAgent(autonomous_agent.AutonomousAgent):
                             input_data_batch[key][0] = input_data_batch[key][0].to(torch.float32)
         step_start_time = time.time()
         # model inference
+        # with autocast(dtype=torch.float16):  # Force fp16 instead of bf16
         output_data_batch = self.model(input_data_batch, return_loss=False, rescale=True)
+
+        # output_data_batch as predictions for the whole batch
+        # dict_keys(['boxes_3d', 'scores_3d', 'labels_3d', 'trajs_3d', 'map_boxes_3d', 'map_scores_3d', 'map_labels_3d', 'map_pts_3d', 'ego_fut_cmd', 'ego_fut_preds_fix_time', 'ego_fut_preds_fix_dist'])
+        # output_data_batch[0]['trajs_3d']: shape of (100, 6, 12)
+        # output_data_batch[0]['labels_3d'] : shape of (100,) discrete for each class
+        # output_data_batch[0]['scores_3d'] : shape of (100,) from 0 to 1
+        # output_data_batch[0]['map_labels_3d']: shape of (33,)
+        # output_data_batch[0]['map_scores_3d']: shape of (33,) from 0 to 1
+        # output_data_batch[0]['map_pts_3d']: shape of (33, 20, 2)
+        # output_data_batch[0]['ego_fut_preds_fix_time']: shape of (1,1,30,2)
+        # output_data_batch[0]['ego_fut_preds_fix_dist']: shape of (1,1,20,2)
+
+        # Ego trajectory mode selection (only 1 mode available for ego)
+        selected_mode = 0
+        
+        # Track agents in ego coordinates across frames
+        # Pass current ego pose for storing with detections
+        # Extract the actual numpy array from DataContainer if needed
+        current_ego_pose = results['ego_pose']
+        if hasattr(current_ego_pose, 'data'):
+            current_ego_pose = current_ego_pose.data
+        # Convert to numpy if it's a tensor
+        if torch.is_tensor(current_ego_pose):
+            current_ego_pose = current_ego_pose.cpu().numpy()
+        
+        # Use raw (unsmoothed) ego pose for tracking to avoid lag
+        self._update_agent_tracking(output_data_batch[0], current_ego_pose)
+        
+        # Visualize agent predictions with their best trajectory modes
+        if 'agent_traj_cls_scores' in output_data_batch[0] and self.step % 10 == 0:
+            # Get agent data
+            agent_boxes = output_data_batch[0]['boxes_3d'].tensor.cpu().numpy()  # (N, 9) [x, y, z, w, l, h, yaw, vx, vy]
+            agent_scores = output_data_batch[0]['scores_3d'].cpu().numpy()  # (N,)
+            agent_labels = output_data_batch[0]['labels_3d'].cpu().numpy()  # (N,)
+            agent_trajs = output_data_batch[0]['trajs_3d'].cpu().numpy()  # (N, 6, 12)
+            agent_traj_cls_scores = output_data_batch[0]['agent_traj_cls_scores'].cpu().numpy()  # (N, 6) or (1, N, 6)
+            
+            # Handle both (N, 6) and (1, N, 6) shapes
+            if agent_traj_cls_scores.ndim == 3:
+                agent_traj_cls_scores = agent_traj_cls_scores[0]  # (N, 6)
+            
+            # Debug: print shapes and values to verify
+            print(f"\n[DEBUG] === Step {self.step} Agent Trajectory Classification Scores ===")
+            print(f"[DEBUG] agent_traj_cls_scores shape: {agent_traj_cls_scores.shape}")
+            print(f"[DEBUG] agent_traj_cls_scores dtype: {agent_traj_cls_scores.dtype}")
+            if len(agent_traj_cls_scores) > 0:
+                print(f"[DEBUG] Score range: [{agent_traj_cls_scores.min():.4f}, {agent_traj_cls_scores.max():.4f}]")
+                print(f"[DEBUG] First 3 agents' scores:")
+                for i in range(min(3, len(agent_traj_cls_scores))):
+                    print(f"[DEBUG]   Agent {i}: {agent_traj_cls_scores[i]}")
+                print(f"[DEBUG] Score std per agent (first 5): {[agent_traj_cls_scores[i].std() for i in range(min(5, len(agent_traj_cls_scores)))]}")
+            
+            # Get best mode for each agent
+            best_modes = np.argmax(agent_traj_cls_scores, axis=1)  # (N,)
+            print(f"[DEBUG] best_modes (first 10): {best_modes[:10] if len(best_modes) > 10 else best_modes}")
+            print(f"[DEBUG] best_modes distribution: {np.bincount(best_modes)}")
+            print(f"[DEBUG] ============================================\n")
+            
+            # Helper function to convert ego coordinates to BEV pixel coordinates
+            def ego_to_pixel(coords_xy):
+                """Convert ego frame (x, y) to BEV pixel coordinates using coor2topdown projection.
+                coords_xy: (N, 2) array of [x, y] in ego frame (lidar coordinates: x forward, y left)
+                Returns: (N, 2) array of [px, py] pixel coordinates
+                """
+                # Swap x,y to match the projection convention (y, x) as done in save() method
+                coords_swapped = coords_xy[:, [1, 0]]  
+                # Add z=0 and homogeneous coordinate
+                coords_3d = np.concatenate([coords_swapped, np.zeros((len(coords_xy), 1)), np.ones((len(coords_xy), 1))], axis=-1)
+                # Project to pixel coordinates
+                pixel_coords = np.dot(self.coor2topdown, coords_3d.T).T
+                # Normalize by homogeneous coordinate
+                pixel_coords[:, :2] /= pixel_coords[:, 2:3]
+                # Flip Y coordinate so forward (positive X in ego) points up in the image
+                # BEV camera looks down, so we need to invert Y to make forward point up
+                pixel_coords[:, 1] = 512 - pixel_coords[:, 1]
+                # Swap X and Y for plotting (so X is forward/up, Y is left/right)
+                pixel_coords = pixel_coords[:, [1, 0]]
+                return pixel_coords[:, :2]
+            
+            # Create visualization with BEV image
+            fig, ax = plt.subplots(figsize=(12, 12))
+            
+            # Display BEV image as background (512x512 pixels)
+            # Flip image vertically so forward points up
+            bev_img = np.flipud(tick_data['bev'])
+            ax.imshow(bev_img, extent=[0, 512, 0, 512], origin='lower', alpha=1.0)
+            
+            ax.set_xlim(-50, 562)
+            ax.set_ylim(-50, 562)
+            ax.set_aspect('equal')
+            ax.grid(True, alpha=0.3, color='white', linewidth=0.5)
+            ax.set_xlabel('X (left, pixels)', fontsize=12, color='white')
+            ax.set_ylabel('Y (forward, pixels)', fontsize=12, color='white')
+            ax.set_title(f'Agent Predictions with Best Trajectory Modes (Step {self.step})', fontsize=14, color='white')
+            ax.tick_params(colors='white')
+            
+            # Enable clipping to prevent labels from being cut off
+            plt.rcParams['text.usetex'] = False
+            fig.tight_layout(pad=2.0)
+            
+            # Plot ego vehicle at origin (convert 0,0 in ego frame to pixels)
+            ego_pixel = ego_to_pixel(np.array([[0, 0]]))[0]
+            ego_circle = Circle(ego_pixel, 10, color='lime', alpha=0.7, linewidth=2, fill=False, label='Ego Vehicle')
+            ax.add_patch(ego_circle)
+            ax.plot(ego_pixel[0], ego_pixel[1], 'g*', markersize=20, markeredgecolor='white', markeredgewidth=1)
+            
+            # Plot lane centerlines if available
+            if 'map_pts_3d' in output_data_batch[0]:
+                map_pts = output_data_batch[0]['map_pts_3d'].cpu().numpy()  # (M, 20, 2)
+                map_scores = output_data_batch[0]['map_scores_3d'].cpu().numpy()  # (M,)
+                map_labels = output_data_batch[0]['map_labels_3d'].cpu().numpy()  # (M,)
+                
+                # Define colors for different map element types
+                map_colors = {
+                    0: 'yellow',      # divider
+                    1: 'white',       # boundary
+                    2: 'cyan',        # ped_crossing
+                }
+                
+                # Plot each lane with score > 0.3
+                for i in range(len(map_pts)):
+                    if map_scores[i] < 0.1:
+                        continue
+                    
+                    lane_pts_ego = map_pts[i]  # (20, 2) in ego frame
+                    lane_pixels = ego_to_pixel(lane_pts_ego)
+                    
+                    label_idx = int(map_labels[i])
+                    color = map_colors.get(label_idx, 'gray')
+                    
+                    # Plot lane as connected line
+                    ax.plot(lane_pixels[:, 0], lane_pixels[:, 1], '-', color=color, 
+                           linewidth=2, alpha=0.7, linestyle='--')
+            
+            # Color map for different agent classes
+            class_colors = ['red', 'orange', 'purple', 'brown', 'pink', 'gray', 'cyan', 'yellow', 'blue', 'magenta']
+            
+            # First, plot tracked agent histories and forecasted trajectories
+            # Get current ego pose for transformation
+            current_ego_pose = results['ego_pose']
+            if hasattr(current_ego_pose, 'data'):
+                current_ego_pose = current_ego_pose.data
+            # Convert to numpy if it's a tensor
+            if torch.is_tensor(current_ego_pose):
+                current_ego_pose = current_ego_pose.cpu().numpy()
+            
+            current_ego_pose_inv = self.invert_pose(current_ego_pose)
+            
+            # Plot each agent with score > 0.3
+            for i in range(len(agent_boxes)):
+                if agent_scores[i] < 0.3:
+                    continue
+                    
+                x, y, z, w, l, h, yaw = agent_boxes[i, 0], agent_boxes[i, 1], agent_boxes[i, 2], agent_boxes[i, 3], agent_boxes[i, 4], agent_boxes[i, 5], agent_boxes[i, 6]
+                vx, vy = agent_boxes[i, 7], agent_boxes[i, 8]  # Velocity in ego frame
+                label_idx = int(agent_labels[i])
+                color = class_colors[label_idx % len(class_colors)]
+                best_mode = best_modes[i]
+                
+                # Draw bounding box in ego frame
+                # Box corners in local frame (width=w, length=l)
+                corners_local = np.array([
+                    [l/2, w/2],    # front-left
+                    [l/2, -w/2],   # front-right
+                    [-l/2, -w/2],  # rear-right
+                    [-l/2, w/2],   # rear-left
+                    [l/2, w/2]     # close the box
+                ])
+                
+                # Rotation matrix for yaw (add 90 degree offset)
+                yaw_corrected = yaw + np.pi/2
+                cos_yaw = np.cos(yaw_corrected)
+                sin_yaw = np.sin(yaw_corrected)
+                rot_matrix = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
+                
+                # Rotate and translate corners to ego frame
+                corners_ego = (rot_matrix @ corners_local.T).T + np.array([x, y])
+                
+                # Convert corners to pixels
+                corners_pixels = ego_to_pixel(corners_ego)
+                
+                # Draw bounding box
+                ax.plot(corners_pixels[:, 0], corners_pixels[:, 1], '-', color=color, linewidth=2, alpha=0.8)
+                
+                # Plot predicted velocity as arrow from agent center
+                agent_pixel = ego_to_pixel(np.array([[x, y]]))[0]
+                scale = 10.0  # Scale velocity for visualization (1 m/s = 10 pixels)
+                vel_end_pos = np.array([[x + vx * scale, y + vy * scale]])
+                vel_end_pixel = ego_to_pixel(vel_end_pos)[0]
+                
+                # Draw velocity arrow
+                ax.arrow(agent_pixel[0], agent_pixel[1], 
+                        vel_end_pixel[0] - agent_pixel[0], 
+                        vel_end_pixel[1] - agent_pixel[1],
+                        head_width=5, head_length=8, fc='cyan', ec='white', 
+                        linewidth=1.5, alpha=0.8, length_includes_head=True)
+            
+            # Plot ego predicted trajectories
+            # Use the EXACT same processing as the save() method for BEV visualization
+            if 'ego_fut_preds_fix_time' in output_data_batch[0] and 'ego_fut_preds_fix_dist' in output_data_batch[0]:
+                # Get raw trajectories from model (same as control code)
+                ego_traj_fix_time_raw = output_data_batch[0]['ego_fut_preds_fix_time'][0, selected_mode, :, [1, 0]].float().cpu().numpy()
+                angles = output_data_batch[0]['ego_fut_preds_fix_dist'][0, selected_mode, :, 0].float().cpu().numpy()
+                ego_traj_fix_dist_raw = np.arange(1, 21, dtype=np.float64).reshape(-1, 1).repeat(2, 1)
+                ego_traj_fix_dist_raw[:, 0] *= np.cos(angles)
+                ego_traj_fix_dist_raw[:, 1] *= np.sin(angles)
+                
+                # Process fix_time trajectory (same as save() method)
+                ego_fut_preds_fix_time_vis = ego_traj_fix_time_raw[:, [1, 0]]
+                ego_fut_preds_fix_time_vis = np.concatenate([ego_fut_preds_fix_time_vis, np.zeros((ego_fut_preds_fix_time_vis.shape[0], 1)), np.ones((ego_fut_preds_fix_time_vis.shape[0], 1))], axis=-1)
+                ego_fut_preds_fix_time_vis = np.dot(self.coor2topdown, ego_fut_preds_fix_time_vis.T).T
+                ego_fut_preds_fix_time_vis[:, :2] /= ego_fut_preds_fix_time_vis[:, 2:3]
+                ego_fut_preds_fix_time_vis = np.nan_to_num(ego_fut_preds_fix_time_vis)
+                # Red ego trajectory (fixed time) removed
+                
+                # Process fix_dist trajectory (same as save() method)
+                ego_fut_preds_fix_dist_vis = ego_traj_fix_dist_raw[:, [1, 0]]
+                ego_fut_preds_fix_dist_vis = np.concatenate([ego_fut_preds_fix_dist_vis, np.zeros((ego_fut_preds_fix_dist_vis.shape[0], 1)), np.ones((ego_fut_preds_fix_dist_vis.shape[0], 1))], axis=-1)
+                ego_fut_preds_fix_dist_vis = np.dot(self.coor2topdown, ego_fut_preds_fix_dist_vis.T).T
+                ego_fut_preds_fix_dist_vis[:, :2] /= ego_fut_preds_fix_dist_vis[:, 2:3]
+                ego_fut_preds_fix_dist_vis = np.nan_to_num(ego_fut_preds_fix_dist_vis)
+                ax.plot(ego_fut_preds_fix_dist_vis[:, 0], 512 - ego_fut_preds_fix_dist_vis[:, 1], 's-', color='blue', 
+                       linewidth=2.5, markersize=4, alpha=0.9, label='Ego Traj (Fixed Dist)')
+            
+            ax.legend(loc='upper right', fontsize=10, facecolor='black', edgecolor='white', labelcolor='white')
+            
+            # Save figure with extra space to prevent clipping
+            if SAVE_PATH is not None:
+                fig_path = self.save_path / 'agent_predictions' 
+                fig_path.mkdir(exist_ok=True)
+                plt.savefig(fig_path / f'{self.step:04d}.png', dpi=150, bbox_inches='tight', 
+                           facecolor='black', pad_inches=0.5)
+            
+            plt.close(fig)
+
+        # breakpoint()
         self.step_time_avg.append(float(time.time()-step_start_time))
         if len(self.step_time_avg)==20:
             # print("Model Avg Step Time:", np.mean(self.step_time_avg))
             self.step_time_avg.pop(0)
         all_out_truck = None
         ego_traj_cls_scores = None
-        selected_mode = 0 
         angles = output_data_batch[0]['ego_fut_preds_fix_dist'][0,selected_mode,:,0].float().cpu().numpy()
         # for trajectories with fixed distance, the output is the angle with y-axis in lidar coordinate system. 
         # get the x, y coordinate with the disance and angle.
@@ -576,6 +827,144 @@ class DriveTransformerAgent(autonomous_agent.AutonomousAgent):
         y = scale * EARTH_RADIUS_EQUA * math.log(math.tan((90.0 + self.lat_ref) * math.pi / 360.0)) - my
         x = mx - scale * self.lon_ref * math.pi * EARTH_RADIUS_EQUA / 180.0
         return np.array([x, y])
+    
+    def _update_agent_tracking(self, detection_data, current_ego_pose):
+        """
+        Track agents across frames in ego coordinates using Hungarian matching.
+        
+        Args:
+            detection_data: dict with keys 'boxes_3d', 'scores_3d', 'labels_3d'
+            current_ego_pose: 4x4 transformation matrix from ego to world at current timestep
+        """
+        if 'boxes_3d' not in detection_data or 'scores_3d' not in detection_data:
+            return
+        
+        agent_boxes = detection_data['boxes_3d'].tensor.cpu().numpy()  # (N, 9)
+        agent_scores = detection_data['scores_3d'].cpu().numpy()  # (N,)
+        
+        # Filter agents by score threshold
+        valid_mask = agent_scores > 0.3
+        valid_boxes = agent_boxes[valid_mask]
+        valid_scores = agent_scores[valid_mask]
+        
+        if len(valid_boxes) == 0:
+            # No detections, age out old tracks
+            self._age_out_tracks()
+            return
+        
+        # Extract positions (x, y in ego frame)
+        current_positions = valid_boxes[:, :2]  # (N, 2)
+        
+        # Get active tracks (not too old)
+        active_track_ids = [tid for tid, track in self.tracked_agents.items() 
+                           if self.step - track['last_seen'] < self.tracking_max_age]
+        
+        if len(active_track_ids) == 0:
+            # No existing tracks, create new ones for all detections
+            for i, pos in enumerate(current_positions):
+                track_id = self.next_agent_id
+                self.next_agent_id += 1
+                # Convert ego position to world position
+                pos_ego_homogeneous = np.array([pos[0], pos[1], 0, 1])
+                pos_world = current_ego_pose @ pos_ego_homogeneous
+                self.tracked_agents[track_id] = {
+                    'positions': [(self.step, pos[0], pos[1], current_ego_pose.copy())],
+                    'world_positions': [(self.step, pos_world[0], pos_world[1])],
+                    'last_seen': self.step,
+                    'score': valid_scores[i]
+                }
+        else:
+            # Match current detections to existing tracks using distance
+            # Build cost matrix (distance between each detection and each track's last position)
+            track_last_positions = []
+            for tid in active_track_ids:
+                last_pos = self.tracked_agents[tid]['positions'][-1]
+                track_last_positions.append([last_pos[1], last_pos[2]])  # [x, y]
+            
+            track_last_positions = np.array(track_last_positions)  # (M, 2)
+            
+            # Compute pairwise distances (N detections x M tracks)
+            from scipy.spatial.distance import cdist
+            cost_matrix = cdist(current_positions, track_last_positions)  # (N, M)
+            
+            # Simple greedy matching (could use Hungarian algorithm for better results)
+            matched_detections = set()
+            matched_tracks = set()
+            matches = []  # [(detection_idx, track_id)]
+            
+            # Sort by distance and greedily match
+            flat_indices = np.argsort(cost_matrix.ravel())
+            for flat_idx in flat_indices:
+                det_idx = flat_idx // len(active_track_ids)
+                track_idx = flat_idx % len(active_track_ids)
+                
+                if det_idx in matched_detections or track_idx in matched_tracks:
+                    continue
+                
+                distance = cost_matrix[det_idx, track_idx]
+                if distance < self.tracking_max_distance:
+                    track_id = active_track_ids[track_idx]
+                    matches.append((det_idx, track_id))
+                    matched_detections.add(det_idx)
+                    matched_tracks.add(track_idx)
+            
+            # Update matched tracks
+            for det_idx, track_id in matches:
+                pos = current_positions[det_idx]
+                # Convert ego position to world position
+                pos_ego_homogeneous = np.array([pos[0], pos[1], 0, 1])
+                pos_world = current_ego_pose @ pos_ego_homogeneous
+                self.tracked_agents[track_id]['positions'].append((self.step, pos[0], pos[1], current_ego_pose.copy()))
+                self.tracked_agents[track_id]['world_positions'].append((self.step, pos_world[0], pos_world[1]))
+                self.tracked_agents[track_id]['last_seen'] = self.step
+                self.tracked_agents[track_id]['score'] = valid_scores[det_idx]
+                
+                # Limit history length to prevent memory growth
+                if len(self.tracked_agents[track_id]['positions']) > 100:
+                    self.tracked_agents[track_id]['positions'] = self.tracked_agents[track_id]['positions'][-100:]
+                    self.tracked_agents[track_id]['world_positions'] = self.tracked_agents[track_id]['world_positions'][-100:]
+            
+            # Create new tracks for unmatched detections
+            for det_idx in range(len(current_positions)):
+                if det_idx not in matched_detections:
+                    pos = current_positions[det_idx]
+                    track_id = self.next_agent_id
+                    self.next_agent_id += 1
+                    # Convert ego position to world position
+                    pos_ego_homogeneous = np.array([pos[0], pos[1], 0, 1])
+                    pos_world = current_ego_pose @ pos_ego_homogeneous
+                    self.tracked_agents[track_id] = {
+                        'positions': [(self.step, pos[0], pos[1], current_ego_pose.copy())],
+                        'world_positions': [(self.step, pos_world[0], pos_world[1])],
+                        'last_seen': self.step,
+                        'score': valid_scores[det_idx]
+                    }
+        
+        # Age out old tracks
+        self._age_out_tracks()
+    
+    def _age_out_tracks(self):
+        """Remove tracks that haven't been seen recently."""
+        tracks_to_remove = []
+        for track_id, track in self.tracked_agents.items():
+            if self.step - track['last_seen'] >= self.tracking_max_age:
+                tracks_to_remove.append(track_id)
+        
+        for track_id in tracks_to_remove:
+            del self.tracked_agents[track_id]
+    
+    def get_agent_trajectories_ego_frame(self, min_length=5):
+        """
+        Get all tracked agent trajectories in ego coordinates.
+        
+        Args:
+            min_length: minimum number of positions required for a trajectory
+            
+        Returns:
+            dict: track_id -> {'positions': [(step, x, y), ...], 'last_seen': step}
+        """
+        return {tid: track for tid, track in self.tracked_agents.items() 
+                if len(track['positions']) >= min_length}
     
     
     

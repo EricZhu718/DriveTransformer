@@ -2,8 +2,11 @@
 import numba
 import numpy as np
 import warnings
-from numba.errors import NumbaPerformanceWarning
-
+try:
+    from numba.errors import NumbaPerformanceWarning  # very old numba
+except ImportError:
+    from numba.core.errors import NumbaPerformanceWarning  # numba >= 0.55
+    
 from mmcv.core.bbox import box_np_ops
 
 warnings.filterwarnings('ignore', category=NumbaPerformanceWarning)
