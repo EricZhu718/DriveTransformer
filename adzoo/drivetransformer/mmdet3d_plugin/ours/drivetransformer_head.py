@@ -392,11 +392,15 @@ class DiffusionHead(nn.Module):
         """
         # Normalize timesteps to [0, 1]
         timesteps_normalized = timesteps.float() / self.num_timesteps
-        
+
+        assert torch.all((0 <= timesteps_normalized) & (timesteps_normalized <= 1)), \
+            f"timesteps must be in [0, {self.num_timesteps-1}], got {timesteps}"
+
         half_dim = dim // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=timesteps.device, dtype=torch.float32) * -emb)
-        emb = timesteps_normalized[:, None] * emb[None, :]
+        # Scale normalized timesteps back up to [0, num_timesteps] range for meaningful sinusoidal values
+        emb = (timesteps_normalized[:, None] * self.num_timesteps) * emb[None, :]
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
         if dim % 2 == 1:
             emb = F.pad(emb, (0, 1), mode='constant')
