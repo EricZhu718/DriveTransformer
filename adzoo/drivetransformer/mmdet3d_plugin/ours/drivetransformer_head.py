@@ -290,7 +290,7 @@ class DiffusionScheduler(nn.Module):
         return min_t, max_t
 
 
-class TrajectoryDenoiser(nn.Module):
+class DiffusionHead(nn.Module):
     """
     Denoiser network that uses cross-attention with intermediate tokens
     to predict noise for trajectory diffusion directly in flattened coordinate space.
@@ -302,7 +302,8 @@ class TrajectoryDenoiser(nn.Module):
                  num_traj_tokens=6,  # number of trajectory timesteps
                  num_timesteps=1000,  # total diffusion timesteps for normalization
                  dropout=0.1,
-                 ffn_dim=1024):
+                 ffn_dim=1024,
+                 num_contexts=1):
         super().__init__()
         self.embed_dims = embed_dims
         self.num_traj_tokens = num_traj_tokens
@@ -327,40 +328,46 @@ class TrajectoryDenoiser(nn.Module):
             nn.Linear(embed_dims * 4, embed_dims),
         )
         
-        # Cross-attention: trajectory tokens attend to context (agent/map/ego queries)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=embed_dims,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.cross_attn_norm = nn.LayerNorm(embed_dims)
+        # Create per-context Cross-attention and Self-attention modules.
+        # We create one pair (cross + self) per expected context (e.g. per decoder layer).
+        self.num_contexts = num_contexts
+        self.cross_attns = nn.ModuleList([
+            nn.MultiheadAttention(embed_dim=embed_dims, num_heads=num_heads, dropout=dropout, batch_first=True)
+            for _ in range(num_contexts)
+        ])
+        self.cross_attn_norms = nn.ModuleList([nn.LayerNorm(embed_dims) for _ in range(num_contexts)])
+
+        # Self-attention on trajectory tokens (per-context)
+        self.self_attns = nn.ModuleList([
+            nn.MultiheadAttention(embed_dim=embed_dims, num_heads=num_heads, dropout=dropout, batch_first=True)
+            for _ in range(num_contexts)
+        ])
+        self.self_attn_norms = nn.ModuleList([nn.LayerNorm(embed_dims) for _ in range(num_contexts)])
         
-        # Self-attention on trajectory tokens
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim=embed_dims,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.self_attn_norm = nn.LayerNorm(embed_dims)
+        # FFNs (one per context) and corresponding LayerNorms.
+        # This allows each denoising step (per decoder layer/context)
+        # to have its own FFN parameters.
+        self.ffns = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(embed_dims, ffn_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(ffn_dim, embed_dims),
+                nn.Dropout(dropout),
+            ) for _ in range(num_contexts)
+        ])
+        self.ffn_norms = nn.ModuleList([nn.LayerNorm(embed_dims) for _ in range(num_contexts)])
         
-        # FFN
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dims, ffn_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, embed_dims),
-            nn.Dropout(dropout),
-        )
-        self.ffn_norm = nn.LayerNorm(embed_dims)
-        
-        # Output projection: predict noise in flattened trajectory space [B, N_timesteps*2]
-        self.output_proj = nn.Sequential(
-            nn.Linear(embed_dims * num_traj_tokens, embed_dims),
-            nn.SiLU(),
-            nn.Linear(embed_dims, self.traj_flat_dim),
-        )
+        # Output projections: predict noise in flattened trajectory space [B, N_timesteps*2]
+        # We keep one output projection per context so each denoising step
+        # can have its own final linear layers.
+        self.output_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(embed_dims * num_traj_tokens, embed_dims),
+                nn.SiLU(),
+                nn.Linear(embed_dims, self.traj_flat_dim),
+            ) for _ in range(num_contexts)
+        ])
         
         self._init_weights()
     
@@ -402,8 +409,8 @@ class TrajectoryDenoiser(nn.Module):
         B = noisy_traj.shape[0]
         assert noisy_traj.dim() == 2 and noisy_traj.shape[1] == self.traj_flat_dim, \
             f"noisy_traj should be [B, {self.traj_flat_dim}], got {noisy_traj.shape}"
-        assert timesteps.dim() == 1 and timesteps.shape[0] == B, \
-            f"timesteps should be [B], got {timesteps.shape}"
+        assert timesteps.dim() == 1, \
+            f"timesteps should be 1D, got {timesteps.shape}"
 
         x = self.input_proj(noisy_traj)
         x = x.view(B, self.num_traj_tokens, self.embed_dims)
@@ -414,47 +421,14 @@ class TrajectoryDenoiser(nn.Module):
         x = x + t_emb.unsqueeze(1)
         return x
 
-    def denoise_from_tokens(self, tokens, timesteps, context):
-        """Run cross-attn, self-attn and FFN on provided tokens, returning
-        (predicted_noise, updated_tokens).
-
-        - `tokens` is expected to already contain positional & time embeddings.
-        - Returns predicted_noise in flattened space [B, traj_flat_dim]
-          and the updated tokens [B, N, D].
-        """
-        B = tokens.shape[0]
-        assert tokens.dim() == 3 and tokens.shape[1] == self.num_traj_tokens and tokens.shape[2] == self.embed_dims, \
-            f"tokens must be [B, {self.num_traj_tokens}, {self.embed_dims}], got {tokens.shape}"
-        assert timesteps.dim() == 1 and timesteps.shape[0] == B, \
-            f"timesteps should be [B], got {timesteps.shape}"
-        assert context.dim() == 3 and context.shape[0] == B and context.shape[2] == self.embed_dims, \
-            f"context must be [B, N_context, {self.embed_dims}], got {context.shape}"
-
-        # Cross-attention with context
-        attn_out, _ = self.cross_attn(query=tokens, key=context, value=context)
-        x = self.cross_attn_norm(tokens + attn_out)
-
-        # Self-attention
-        self_attn_out, _ = self.self_attn(query=x, key=x, value=x)
-        x = self.self_attn_norm(x + self_attn_out)
-
-        # FFN
-        x = self.ffn_norm(x + self.ffn(x))
-
-        # Project to predicted noise
-        x_flat = x.view(B, -1)
-        predicted_noise = self.output_proj(x_flat)
-
-        return predicted_noise, x
-
-    def denoise_with_contexts(self, tokens, timesteps, contexts):
+    def denoise_with_contexts(self, tokens, contexts):
         """Denoise tokens using multiple contexts in sequence.
 
         Args:
             tokens: trajectory tokens [B, N_traj_tokens, D]
-            timesteps: timesteps [B]
             contexts: either a list/tuple of context tensors where each is [B, N_ctx_i, D],
-                      or a single tensor with shape [L, B, N_ctx, D].
+                      or a single tensor with shape [L, B, N_ctx, D]. Each element in list is a tensor 
+                      of tokens to perform cross attention over.
 
         Returns:
             predicted_noises: Tensor of shape [L, B, traj_flat_dim] (one predicted noise per context)
@@ -463,8 +437,6 @@ class TrajectoryDenoiser(nn.Module):
         B = tokens.shape[0]
         assert tokens.dim() == 3 and tokens.shape[1] == self.num_traj_tokens and tokens.shape[2] == self.embed_dims, \
             f"tokens must be [B, {self.num_traj_tokens}, {self.embed_dims}], got {tokens.shape}"
-        assert timesteps.dim() == 1 and timesteps.shape[0] == B, \
-            f"timesteps should be [B], got {timesteps.shape}"
 
         # Normalize contexts into an iterable of [B, N_ctx, D]
         contexts_iter = None
@@ -479,110 +451,37 @@ class TrajectoryDenoiser(nn.Module):
 
         predicted_list = []
         x = tokens
-        for ctx in contexts_iter:
+        for i, ctx in enumerate(contexts_iter):
             assert ctx.dim() == 3 and ctx.shape[0] == B and ctx.shape[2] == self.embed_dims, \
                 f"each context must be [B, N_ctx, {self.embed_dims}], got {ctx.shape}"
 
+            cross_attn_module = self.cross_attns[i]
+            cross_attn_norm = self.cross_attn_norms[i]
+            self_attn_module = self.self_attns[i]
+            self_attn_norm = self.self_attn_norms[i]
+
             # Cross-attention with this context
-            attn_out, _ = self.cross_attn(query=x, key=ctx, value=ctx)
-            x = self.cross_attn_norm(x + attn_out)
-
+            attn_out, _ = cross_attn_module(query=x, key=ctx, value=ctx)
+            x = cross_attn_norm(x + attn_out)
             # Self-attention
-            self_attn_out, _ = self.self_attn(query=x, key=x, value=x)
-            x = self.self_attn_norm(x + self_attn_out)
+            self_attn_out, _ = self_attn_module(query=x, key=x, value=x)
+            x = self_attn_norm(x + self_attn_out)
 
-            # FFN
-            x = self.ffn_norm(x + self.ffn(x))
+            # FFN (per-context)
+            ffn_module = self.ffns[i]
+            ffn_norm = self.ffn_norms[i]
+            x = ffn_norm(x + ffn_module(x))
 
-            # Project to predicted noise for this step
+            # Project to predicted noise for this step (use per-context proj)
             x_flat = x.view(B, -1)
-            predicted_noise = self.output_proj(x_flat)
+            out_proj = self.output_projs[i]
+            predicted_noise = out_proj(x_flat)
             predicted_list.append(predicted_noise)
 
         # Stack predictions into [L, B, traj_flat_dim]
         predicted_noises = torch.stack(predicted_list, dim=0)
         return predicted_noises, x
     
-    def forward(self, noisy_traj_or_tokens, timesteps, context):
-        """
-        Predict noise given either a flattened noisy trajectory or pre-built
-        trajectory tokens, plus context.
-
-        Args:
-            noisy_traj_or_tokens: Either
-                - flattened noisy trajectory [B, N_timesteps * 2], OR
-                - trajectory tokens [B, N_timesteps, D]
-            timesteps: Diffusion timesteps [B]
-            context: Context tokens (concatenated agent/map/ego queries) [B, N_context, D]
-
-        Returns:
-            predicted_noise: Predicted noise in flattened space [B, N_timesteps * 2]
-        """
-        B = noisy_traj_or_tokens.shape[0]
-
-        # Validate timesteps and context first
-        assert timesteps.dim() == 1 and timesteps.shape[0] == B, \
-            f"timesteps should be [B], got {timesteps.shape}"
-        assert context.dim() == 3, \
-            f"context should be 3D [B, N_context, D], got {context.shape}"
-        assert context.shape[0] == B, \
-            f"context batch size mismatch: expected {B}, got {context.shape[0]}"
-        assert context.shape[2] == self.embed_dims, \
-            f"context embed_dim mismatch: expected {self.embed_dims}, got {context.shape[2]}"
-
-        # If input is flattened trajectory, project to trajectory tokens.
-        if noisy_traj_or_tokens.dim() == 2:
-            noisy_traj = noisy_traj_or_tokens
-            assert noisy_traj.shape[1] == self.traj_flat_dim, \
-                f"noisy_traj dim mismatch: expected [B, {self.traj_flat_dim}], got {noisy_traj.shape}"
-            x = self.input_proj(noisy_traj)  # [B, N_timesteps * D]
-            x = x.view(B, self.num_traj_tokens, self.embed_dims)  # [B, N_timesteps, D]
-        elif noisy_traj_or_tokens.dim() == 3:
-            x = noisy_traj_or_tokens
-            assert x.shape[1] == self.num_traj_tokens, \
-                f"trajectory tokens length mismatch: expected {self.num_traj_tokens}, got {x.shape[1]}"
-            assert x.shape[2] == self.embed_dims, \
-                f"trajectory token embed dim mismatch: expected {self.embed_dims}, got {x.shape[2]}"
-        else:
-            raise ValueError(f"Unsupported input shape for TrajectoryDenoiser: {noisy_traj_or_tokens.shape}")
-        
-        # Add positional embedding
-        x = x + self.pos_embed
-        
-        # Get time embedding and add to trajectory
-        t_emb = self.get_timestep_embedding(timesteps, self.embed_dims)
-        t_emb = self.time_embed(t_emb)  # [B, D]
-        x = x + t_emb.unsqueeze(1)  # [B, N_timesteps, D]
-        
-        # Cross-attention with context
-        attn_out, _ = self.cross_attn(
-            query=x,
-            key=context,
-            value=context
-        )
-        x = self.cross_attn_norm(x + attn_out)
-        
-        # Self-attention
-        self_attn_out, _ = self.self_attn(
-            query=x,
-            key=x,
-            value=x
-        )
-        x = self.self_attn_norm(x + self_attn_out)
-        
-        # FFN
-        x = self.ffn_norm(x + self.ffn(x))
-        
-        # Flatten and project back to flattened trajectory space
-        x = x.view(B, -1)  # [B, N_timesteps * D]
-        predicted_noise = self.output_proj(x)  # [B, N_timesteps * 2]
-        
-        # Output shape assertion
-        assert predicted_noise.shape == (B, self.traj_flat_dim), \
-            f"predicted_noise shape mismatch: expected {(B, self.traj_flat_dim)}, got {predicted_noise.shape}"
-        
-        return predicted_noise
-
 
 @HEADS.register_module()
 class DriveTransformerlHead(BaseModule):
@@ -1067,16 +966,15 @@ class DriveTransformerlHead(BaseModule):
         # The denoiser supports being passed many context tensors (one per decoder
         # layer) while tokenizing the noisy trajectory only once.
         if self.use_diffusion_loss:
-            self.trajectory_denoiser = TrajectoryDenoiser(
+            self.diffusion_head = DiffusionHead(
                 embed_dims=self.embed_dims,
                 num_heads=self.diffusion_num_heads,
                 num_traj_tokens=self.diffusion_num_traj_tokens,
                 num_timesteps=self.diffusion_num_timesteps,
                 dropout=0.1,
-                ffn_dim=self.diffusion_ffn_dim
+                ffn_dim=self.diffusion_ffn_dim,
+                num_contexts=num_mixed_up_layers
             )
-            # store decoder layer count to help loss/scheduler logic
-            self.num_mixed_up_layers = num_mixed_up_layers
     
     def xavier_uniform_linear(self, m):
         is_linear_layer = any([isinstance(m, nn.Linear), isinstance(m, nn.Conv2d), isinstance(m, nn.ConvTranspose2d)])
@@ -2009,16 +1907,9 @@ class DriveTransformerlHead(BaseModule):
             f"noisy_traj shape mismatch: expected {clean_traj.shape}, got {noisy_traj.shape}"
         assert noise.shape == clean_traj.shape, \
             f"noise shape mismatch: expected {clean_traj.shape}, got {noise.shape}"
-        
-        layer_losses = []
-        
-        # Initialize noise prediction with zeros (like initial prediction in decoder)
-        predicted_noise_cumulative = torch.zeros_like(noisy_traj)
-
-        # Tokenize once from the noisy flattened trajectory and timestep
-        tokens = self.trajectory_denoiser.tokenize(noisy_traj, t)
-
-        # Build list of contexts (one per layer) so we can call the denoiser once
+                
+        # Build list of contexts (one per layer) so we can call the denoiser once. 
+        # Each context is a tensor of tokens to cross attend over
         contexts = []
         for layer_idx in range(num_layers):
             agent_query_tokens_at_layer = intermediate_agent_query[layer_idx] if intermediate_agent_query is not None else None
@@ -2045,9 +1936,18 @@ class DriveTransformerlHead(BaseModule):
 
             contexts.append(context)
 
+        # Tokenize once from the noisy flattened trajectory and timestep
+        tokens = self.diffusion_head.tokenize(noisy_traj, t)
+
         # Call denoiser once with the list of contexts; get L predictions and final tokens
         # predicted_noises: [L, B, traj_flat_dim]
-        predicted_noises, tokens = self.trajectory_denoiser.denoise_with_contexts(tokens, t, contexts)
+        predicted_noises, tokens = self.diffusion_head.denoise_with_contexts(tokens, contexts)
+
+        # record the predicted noise at each layer
+        layer_losses = []
+
+        # Initialize noise prediction with zeros (like initial prediction in decoder)
+        predicted_noise_cumulative = torch.zeros_like(noisy_traj)
 
         # Iteratively accumulate predictions and compute per-layer losses
         for layer_idx in range(num_layers):
@@ -2073,63 +1973,63 @@ class DriveTransformerlHead(BaseModule):
         
         # Average across layers and apply weight
         total_loss = torch.stack(layer_losses).mean() * self.diffusion_loss_weight
-        return torch.nan_to_num(total_loss)
+        return total_loss
     
-    @torch.no_grad()
-    def diffusion_sample(self, 
-                         intermediate_agent_query,
-                         intermediate_map_query,
-                         intermediate_ego_query,
-                         num_steps=None):
-        """
-        Generate trajectory samples using the reverse diffusion process.
-        Operates in flattened coordinate space [B, N_timesteps * 2].
+    # @torch.no_grad()
+    # def diffusion_sample(self, 
+    #                      intermediate_agent_query,
+    #                      intermediate_map_query,
+    #                      intermediate_ego_query,
+    #                      num_steps=None):
+    #     """
+    #     Generate trajectory samples using the reverse diffusion process.
+    #     Operates in flattened coordinate space [B, N_timesteps * 2].
         
-        Args:
-            intermediate_agent_query: [N_layers+1, B, N_agent_query, D]
-            intermediate_map_query: [N_layers+1, B, N_map_query, D]
-            intermediate_ego_query: [N_layers+1, B, N_ego_mode, D]
-            num_steps: Number of denoising steps (default: all timesteps)
+    #     Args:
+    #         intermediate_agent_query: [N_layers+1, B, N_agent_query, D]
+    #         intermediate_map_query: [N_layers+1, B, N_map_query, D]
+    #         intermediate_ego_query: [N_layers+1, B, N_ego_mode, D]
+    #         num_steps: Number of denoising steps (default: all timesteps)
         
-        Returns:
-            sampled_traj: Generated trajectory coordinates [B, N_timesteps * 2] (flattened)
-        """
-        if not self.use_diffusion_loss:
-            return None
+    #     Returns:
+    #         sampled_traj: Generated trajectory coordinates [B, N_timesteps * 2] (flattened)
+    #     """
+    #     if not self.use_diffusion_loss:
+    #         return None
         
-        batch_size = intermediate_ego_query.shape[1]
-        device = intermediate_ego_query.device
-        num_layers = len(self.trajectory_denoisers)
+    #     batch_size = intermediate_ego_query.shape[1]
+    #     device = intermediate_ego_query.device
+    #     num_layers = len(self.trajectory_denoisers)
         
-        # Use final layer queries as context
-        agent_query = intermediate_agent_query[-1] if intermediate_agent_query is not None else None
-        map_query = intermediate_map_query[-1] if intermediate_map_query is not None else None
-        ego_query = intermediate_ego_query[-1]
+    #     # Use final layer queries as context
+    #     agent_query = intermediate_agent_query[-1] if intermediate_agent_query is not None else None
+    #     map_query = intermediate_map_query[-1] if intermediate_map_query is not None else None
+    #     ego_query = intermediate_ego_query[-1]
         
-        # Build context
-        context_list = []
-        if agent_query is not None:
-            context_list.append(agent_query)
-        if map_query is not None:
-            context_list.append(map_query)
-        context_list.append(ego_query)
-        context = torch.cat(context_list, dim=1)
+    #     # Build context
+    #     context_list = []
+    #     if agent_query is not None:
+    #         context_list.append(agent_query)
+    #     if map_query is not None:
+    #         context_list.append(map_query)
+    #     context_list.append(ego_query)
+    #     context = torch.cat(context_list, dim=1)
         
-        # Define denoising function that uses the final layer's denoiser
-        def denoise_fn(x_t, t):
-            return self.trajectory_denoisers[-1](x_t, t, context)
+    #     # Define denoising function that uses the final layer's denoiser
+    #     def denoise_fn(x_t, t):
+    #         return self.trajectory_denoisers[-1](x_t, t, context)
         
-        # Generate samples in flattened coordinate space [B, N_timesteps * 2]
-        shape = (batch_size, self.diffusion_num_traj_tokens * 2)
-        sampled_traj = self.diffusion_scheduler.p_sample_loop(
-            denoise_fn=denoise_fn,
-            shape=shape,
-            context=context,
-            clip_denoised=False,
-            device=device
-        )
+    #     # Generate samples in flattened coordinate space [B, N_timesteps * 2]
+    #     shape = (batch_size, self.diffusion_num_traj_tokens * 2)
+    #     sampled_traj = self.diffusion_scheduler.p_sample_loop(
+    #         denoise_fn=denoise_fn,
+    #         shape=shape,
+    #         context=context,
+    #         clip_denoised=False,
+    #         device=device
+    #     )
         
-        return sampled_traj
+    #     return sampled_traj
     
     def loss_single(self,
                     cls_scores,
