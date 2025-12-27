@@ -310,9 +310,11 @@ class TrajectoryDenoiser(nn.Module):
         self.traj_flat_dim = num_traj_tokens * 2  # flattened trajectory dimension
         
         # Input projection: project flattened noisy trajectory [B, N_timesteps*2] to [B, N_timesteps, D] for attention
+        hidden = embed_dims * num_traj_tokens
         self.input_proj = nn.Sequential(
-            nn.Linear(self.traj_flat_dim, embed_dims * num_traj_tokens),
+            nn.Linear(self.traj_flat_dim, hidden),
             nn.SiLU(),
+            nn.Linear(hidden, hidden),
         )
         
         # Positional embedding for trajectory tokens
@@ -444,6 +446,62 @@ class TrajectoryDenoiser(nn.Module):
         predicted_noise = self.output_proj(x_flat)
 
         return predicted_noise, x
+
+    def denoise_with_contexts(self, tokens, timesteps, contexts):
+        """Denoise tokens using multiple contexts in sequence.
+
+        Args:
+            tokens: trajectory tokens [B, N_traj_tokens, D]
+            timesteps: timesteps [B]
+            contexts: either a list/tuple of context tensors where each is [B, N_ctx_i, D],
+                      or a single tensor with shape [L, B, N_ctx, D].
+
+        Returns:
+            predicted_noises: Tensor of shape [L, B, traj_flat_dim] (one predicted noise per context)
+            tokens: final tokens after applying all layers [B, N_traj_tokens, D]
+        """
+        B = tokens.shape[0]
+        assert tokens.dim() == 3 and tokens.shape[1] == self.num_traj_tokens and tokens.shape[2] == self.embed_dims, \
+            f"tokens must be [B, {self.num_traj_tokens}, {self.embed_dims}], got {tokens.shape}"
+        assert timesteps.dim() == 1 and timesteps.shape[0] == B, \
+            f"timesteps should be [B], got {timesteps.shape}"
+
+        # Normalize contexts into an iterable of [B, N_ctx, D]
+        contexts_iter = None
+        if isinstance(contexts, torch.Tensor):
+            # expected [L, B, N_ctx, D]
+            assert contexts.dim() == 4, f"contexts tensor must be 4D [L, B, N_ctx, D], got {contexts.shape}"
+            contexts_iter = [contexts[i] for i in range(contexts.shape[0])]
+        elif isinstance(contexts, (list, tuple)):
+            contexts_iter = contexts
+        else:
+            raise ValueError("contexts must be a tensor [L,B,N_ctx,D] or a list/tuple of [B,N_ctx,D]")
+
+        predicted_list = []
+        x = tokens
+        for ctx in contexts_iter:
+            assert ctx.dim() == 3 and ctx.shape[0] == B and ctx.shape[2] == self.embed_dims, \
+                f"each context must be [B, N_ctx, {self.embed_dims}], got {ctx.shape}"
+
+            # Cross-attention with this context
+            attn_out, _ = self.cross_attn(query=x, key=ctx, value=ctx)
+            x = self.cross_attn_norm(x + attn_out)
+
+            # Self-attention
+            self_attn_out, _ = self.self_attn(query=x, key=x, value=x)
+            x = self.self_attn_norm(x + self_attn_out)
+
+            # FFN
+            x = self.ffn_norm(x + self.ffn(x))
+
+            # Project to predicted noise for this step
+            x_flat = x.view(B, -1)
+            predicted_noise = self.output_proj(x_flat)
+            predicted_list.append(predicted_noise)
+
+        # Stack predictions into [L, B, traj_flat_dim]
+        predicted_noises = torch.stack(predicted_list, dim=0)
+        return predicted_noises, x
     
     def forward(self, noisy_traj_or_tokens, timesteps, context):
         """
@@ -1005,9 +1063,11 @@ class DriveTransformerlHead(BaseModule):
         self.ego_traj_branches_fix_time = _get_clones(ego_traj_branch_fix_time, ego_num_pred)
         self.ego_traj_cls_branches = _get_clones(ego_traj_cls_branch, ego_num_pred) if self.ego_multi_modal else None
         
-        # Create trajectory denoisers - one per decoder layer for iterative refinement
+        # Create a single trajectory denoiser to be called once during diffusion loss.
+        # The denoiser supports being passed many context tensors (one per decoder
+        # layer) while tokenizing the noisy trajectory only once.
         if self.use_diffusion_loss:
-            trajectory_denoiser = TrajectoryDenoiser(
+            self.trajectory_denoiser = TrajectoryDenoiser(
                 embed_dims=self.embed_dims,
                 num_heads=self.diffusion_num_heads,
                 num_traj_tokens=self.diffusion_num_traj_tokens,
@@ -1015,8 +1075,8 @@ class DriveTransformerlHead(BaseModule):
                 dropout=0.1,
                 ffn_dim=self.diffusion_ffn_dim
             )
-            # create one denoiser per decoder layer PLUS the initial token state
-            self.trajectory_denoisers = _get_clones(trajectory_denoiser, num_mixed_up_layers + 1)
+            # store decoder layer count to help loss/scheduler logic
+            self.num_mixed_up_layers = num_mixed_up_layers
     
     def xavier_uniform_linear(self, m):
         is_linear_layer = any([isinstance(m, nn.Linear), isinstance(m, nn.Conv2d), isinstance(m, nn.ConvTranspose2d)])
@@ -1956,21 +2016,20 @@ class DriveTransformerlHead(BaseModule):
         predicted_noise_cumulative = torch.zeros_like(noisy_traj)
 
         # Tokenize once from the noisy flattened trajectory and timestep
-        tokens = self.trajectory_denoisers[0].tokenize(noisy_traj, t)
+        tokens = self.trajectory_denoiser.tokenize(noisy_traj, t)
 
-        # For each intermediate layer, iteratively refine the denoising prediction
+        # Build list of contexts (one per layer) so we can call the denoiser once
+        contexts = []
         for layer_idx in range(num_layers):
-            # Get intermediate queries at this layer
             agent_query_tokens_at_layer = intermediate_agent_query[layer_idx] if intermediate_agent_query is not None else None
             map_query_tokens_at_layer = intermediate_map_query[layer_idx] if intermediate_map_query is not None else None
             ego_query_tokens_at_layer = intermediate_ego_query[layer_idx]
-            
+
             # Assert layer query shapes
             assert ego_query_tokens_at_layer.dim() == 3, \
                 f"ego_query_tokens_at_layer should be 3D [B, N_ego, D], got {ego_query_tokens_at_layer.shape}"
-            
+
             # Concatenate all queries to form context for cross-attention
-            # Context: [B, N_agent + N_map + N_ego, D]
             context_list = []
             if agent_query_tokens_at_layer is not None:
                 context_list.append(agent_query_tokens_at_layer)
@@ -1978,24 +2037,27 @@ class DriveTransformerlHead(BaseModule):
                 context_list.append(map_query_tokens_at_layer)
             context_list.append(ego_query_tokens_at_layer)
             context = torch.cat(context_list, dim=1)  # [B, N_context, D]
-            
+
             # Assert context shape
             assert context.dim() == 3, f"context should be 3D [B, N_context, D], got {context.shape}"
             assert context.shape[0] == batch_size, f"context batch_size mismatch"
             assert context.shape[2] == self.embed_dims, f"context embed_dim mismatch"
-            
-            # Use layer-specific trajectory denoiser to predict noise delta with cross-attention to context
-            # `denoise_from_tokens` returns (predicted_noise_delta, updated_tokens)
-            predicted_noise_delta, tokens = self.trajectory_denoisers[layer_idx].denoise_from_tokens(tokens, t, context)
 
-            # Iterative refinement: add delta to cumulative prediction (like decoder layers)
-            # This mirrors how DriveTransformer refines predictions: new_pred = old_pred + delta
+            contexts.append(context)
+
+        # Call denoiser once with the list of contexts; get L predictions and final tokens
+        # predicted_noises: [L, B, traj_flat_dim]
+        predicted_noises, tokens = self.trajectory_denoiser.denoise_with_contexts(tokens, t, contexts)
+
+        # Iteratively accumulate predictions and compute per-layer losses
+        for layer_idx in range(num_layers):
+            predicted_noise_delta = predicted_noises[layer_idx]
             predicted_noise_cumulative = predicted_noise_cumulative + predicted_noise_delta
-            
+
             # Assert predicted_noise shape
             assert predicted_noise_cumulative.shape == noise.shape, \
                 f"predicted_noise_cumulative shape mismatch: expected {noise.shape}, got {predicted_noise_cumulative.shape}"
-            
+
             # Compute loss between cumulative prediction and actual noise
             if self.diffusion_loss_type == 'mse':
                 loss = F.mse_loss(predicted_noise_cumulative, noise, reduction='mean')
@@ -2003,7 +2065,7 @@ class DriveTransformerlHead(BaseModule):
                 loss = F.l1_loss(predicted_noise_cumulative, noise, reduction='mean')
             else:
                 raise ValueError(f"Unknown diffusion loss type: {self.diffusion_loss_type}")
-            
+
             layer_losses.append(loss)
         
         if len(layer_losses) == 0:
