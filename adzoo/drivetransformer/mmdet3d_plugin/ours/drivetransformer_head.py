@@ -968,7 +968,7 @@ class DriveTransformerlHead(BaseModule):
         
         # Create a single trajectory denoiser to be called once during diffusion loss.
         # The denoiser supports being passed many context tensors (one per decoder
-        # layer) while tokenizing the noisy trajectory only once.
+        # layer + initial state) while tokenizing the noisy trajectory only once.
         if self.use_diffusion_loss:
             self.diffusion_head = DiffusionHead(
                 embed_dims=self.embed_dims,
@@ -977,7 +977,7 @@ class DriveTransformerlHead(BaseModule):
                 num_timesteps=self.diffusion_num_timesteps,
                 dropout=0.1,
                 ffn_dim=self.diffusion_ffn_dim,
-                num_contexts=num_mixed_up_layers
+                num_contexts=num_mixed_up_layers + 1  # +1 for initial token state
             )
     
     def xavier_uniform_linear(self, m):
