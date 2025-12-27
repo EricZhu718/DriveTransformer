@@ -17,10 +17,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # camera coordinate system, and lidar coordinate system) to the right-handed coordinate system
 # consistent with the nuscenes dataset.
 
-DATAROOT = '../../../../data/bench2drive'
-MAP_ROOT = '../../../../data/bench2drive/maps'
-OUT_DIR = '../../../../data/infos'
-SPLIT_PATH = '../../../../data/split/bench2drive_base_train_val_split.json'
+# DATAROOT = '../../../../data/bench2drive'
+# MAP_ROOT = '../../../../data/bench2drive/maps'
+# OUT_DIR = '../../../../data/infos'
+# SPLIT_PATH = '../../../../data/split/bench2drive_base_train_val_split.json'
+
+DATAROOT = "/lustre/scratch/ezhu3/Bench2Drive_For_DriveTransformer/Bench2DriveZoo/data/bench2drive"
+MAP_ROOT = DATAROOT + '/maps'
+OUT_DIR = "/lustre/scratch/ezhu3/Bench2Drive_For_DriveTransformer/Bench2DriveZoo/data/infos"
+SPLIT_PATH = '/lustre/scratch/ezhu3/Bench2Drive_For_DriveTransformer/Bench2DriveZoo/split/bench2drive_base_train_val_split.json'
 
 MAX_DISTANCE = 75              # Filter bounding boxes that are too far from the vehicle
 FILTER_Z_SHRESHOLD = 10        # Filter bounding boxes that are too high/low from the vehicle
@@ -197,6 +202,18 @@ def gengrate_map(map_root):
         pickle.dump(map_infos,f)
 
 def preprocess(folder_name, split):
+    
+    # Check if this file has already been processed
+    output_dir = join(OUT_DIR, 'b2d_infos_' + split + '_drivetransformer')
+    output_file = join(output_dir, folder_name.split('/')[1]+'.pkl')
+    
+    if os.path.exists(output_file):
+        print(f"Skipping {folder_name.split('/')[1]} - already processed")
+        # Load the existing file to get metadata
+        with open(output_file, 'rb') as f:
+            route_data = pickle.load(f)
+        meta = {'route_name':folder_name.split('/')[1],'lenth':len(route_data)}
+        return meta
 
     data_root = DATAROOT
     cameras = CAMERAS

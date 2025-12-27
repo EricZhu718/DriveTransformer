@@ -29,6 +29,503 @@ from mmcv.models.backbones.base_module import BaseModule
 from mmcv.core.bbox.structures.lidar_box3d import LiDARInstance3DBoxes
 
 
+class DiffusionScheduler(nn.Module):
+    """
+    Diffusion scheduler for forward and reverse diffusion processes.
+    Handles noise scheduling, q_sample (forward), and p_sample (reverse).
+    """
+    def __init__(self, 
+                 num_timesteps=1000, 
+                 beta_start=0.0001, 
+                 beta_end=0.02,
+                 schedule_type='linear'):
+        super().__init__()
+        self.num_timesteps = num_timesteps
+        self.schedule_type = schedule_type
+        
+        # Create beta schedule
+        if schedule_type == 'linear':
+            betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
+        elif schedule_type == 'cosine':
+            # Cosine schedule as proposed in "Improved Denoising Diffusion Probabilistic Models"
+            steps = num_timesteps + 1
+            s = 0.008
+            x = torch.linspace(0, num_timesteps, steps, dtype=torch.float32)
+            alphas_cumprod = torch.cos(((x / num_timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            betas = torch.clamp(betas, 0.0001, 0.9999)
+        elif schedule_type == 'quadratic':
+            betas = torch.linspace(beta_start ** 0.5, beta_end ** 0.5, num_timesteps, dtype=torch.float32) ** 2
+        else:
+            raise ValueError(f"Unknown schedule type: {schedule_type}")
+        
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+        
+        # Calculations for diffusion q(x_t | x_{t-1}) and others
+        sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+        sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+        sqrt_recip_alphas_cumprod = torch.sqrt(1.0 / alphas_cumprod)
+        sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / alphas_cumprod - 1)
+        
+        # Calculations for posterior q(x_{t-1} | x_t, x_0)
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        posterior_log_variance_clipped = torch.log(torch.clamp(posterior_variance, min=1e-20))
+        posterior_mean_coef1 = betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        posterior_mean_coef2 = (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod)
+        
+        # Register as buffers
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas', alphas)
+        self.register_buffer('alphas_cumprod', alphas_cumprod)
+        self.register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+        self.register_buffer('sqrt_alphas_cumprod', sqrt_alphas_cumprod)
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', sqrt_one_minus_alphas_cumprod)
+        self.register_buffer('sqrt_recip_alphas_cumprod', sqrt_recip_alphas_cumprod)
+        self.register_buffer('sqrt_recipm1_alphas_cumprod', sqrt_recipm1_alphas_cumprod)
+        self.register_buffer('posterior_variance', posterior_variance)
+        self.register_buffer('posterior_log_variance_clipped', posterior_log_variance_clipped)
+        self.register_buffer('posterior_mean_coef1', posterior_mean_coef1)
+        self.register_buffer('posterior_mean_coef2', posterior_mean_coef2)
+    
+    def _extract(self, a, t, x_shape):
+        """Extract coefficients at specified timesteps and reshape for broadcasting."""
+        batch_size = t.shape[0]
+        out = a.gather(-1, t)
+        return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))
+    
+    def q_sample(self, x_start, t, noise=None):
+        """
+        Forward diffusion process: add noise to x_start according to timestep t.
+        q(x_t | x_0) = N(x_t; sqrt(alpha_bar_t) * x_0, (1 - alpha_bar_t) * I)
+        
+        Args:
+            x_start: Clean input tensor [B, ...]
+            t: Timestep tensor [B]
+            noise: Optional pre-sampled noise, same shape as x_start
+        
+        Returns:
+            x_noisy: Noisy tensor at timestep t
+            noise: The noise that was added
+        """
+        # Shape assertions
+        assert x_start.dim() >= 1, f"x_start should have at least 1 dimension, got {x_start.shape}"
+        assert t.dim() == 1, f"t should be 1D [B], got {t.shape}"
+        assert t.shape[0] == x_start.shape[0], \
+            f"Batch size mismatch: x_start has {x_start.shape[0]}, t has {t.shape[0]}"
+        
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        else:
+            assert noise.shape == x_start.shape, \
+                f"noise shape {noise.shape} must match x_start shape {x_start.shape}"
+        
+        sqrt_alphas_cumprod_t = self._extract(self.sqrt_alphas_cumprod, t, x_start.shape)
+        sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+        
+        x_noisy = sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
+        
+        # Output shape assertions
+        assert x_noisy.shape == x_start.shape, \
+            f"x_noisy shape {x_noisy.shape} must match x_start shape {x_start.shape}"
+        
+        return x_noisy, noise
+    
+    def predict_start_from_noise(self, x_t, t, noise):
+        """
+        Predict x_0 from x_t and predicted noise.
+        x_0 = (x_t - sqrt(1 - alpha_bar_t) * noise) / sqrt(alpha_bar_t)
+        """
+        sqrt_recip_alphas_cumprod_t = self._extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape)
+        sqrt_recipm1_alphas_cumprod_t = self._extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+        return sqrt_recip_alphas_cumprod_t * x_t - sqrt_recipm1_alphas_cumprod_t * noise
+    
+    def q_posterior_mean_variance(self, x_start, x_t, t):
+        """
+        Compute the mean and variance of the diffusion posterior q(x_{t-1} | x_t, x_0).
+        """
+        posterior_mean_coef1_t = self._extract(self.posterior_mean_coef1, t, x_t.shape)
+        posterior_mean_coef2_t = self._extract(self.posterior_mean_coef2, t, x_t.shape)
+        posterior_mean = posterior_mean_coef1_t * x_start + posterior_mean_coef2_t * x_t
+        posterior_variance = self._extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = self._extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+    
+    def p_mean_variance(self, denoise_fn, x_t, t, context=None, clip_denoised=True):
+        """
+        Compute mean and variance for p(x_{t-1} | x_t) using a denoising function.
+        
+        Args:
+            denoise_fn: Function that predicts noise given (x_t, t, context)
+            x_t: Noisy input at timestep t
+            t: Current timestep
+            context: Optional context for conditional generation
+            clip_denoised: Whether to clip x_0 predictions to [-1, 1]
+        """
+        # Predict noise
+        if context is not None:
+            predicted_noise = denoise_fn(x_t, t, context)
+        else:
+            predicted_noise = denoise_fn(x_t, t)
+        
+        # Predict x_0
+        x_start = self.predict_start_from_noise(x_t, t, predicted_noise)
+        
+        if clip_denoised:
+            x_start = torch.clamp(x_start, -1.0, 1.0)
+        
+        # Get posterior
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior_mean_variance(
+            x_start=x_start, x_t=x_t, t=t
+        )
+        return model_mean, posterior_variance, posterior_log_variance, x_start
+    
+    @torch.no_grad()
+    def p_sample(self, denoise_fn, x_t, t, t_prev=None, context=None, clip_denoised=True, eta=0.0):
+        """
+        DDIM sampling step: deterministically denoise from x_t to x_{t-1}.
+        
+        Args:
+            denoise_fn: Function that predicts noise given (x_t, t, context)
+            x_t: Noisy input at timestep t
+            t: Current timestep tensor [B]
+            t_prev: Previous timestep (default: t-1)
+            context: Optional context for conditional generation
+            clip_denoised: Whether to clip x_0 predictions
+            eta: DDIM stochasticity parameter (0 = deterministic, 1 = DDPM)
+        
+        Returns:
+            x_{t-1}: Denoised sample
+        """
+        # Predict noise
+        if context is not None:
+            predicted_noise = denoise_fn(x_t, t, context)
+        else:
+            predicted_noise = denoise_fn(x_t, t)
+        
+        # Predict x_0 from noise
+        alpha_t = self._extract(self.alphas_cumprod, t, x_t.shape)
+        x_0_pred = (x_t - torch.sqrt(1 - alpha_t) * predicted_noise) / torch.sqrt(alpha_t)
+        
+        if clip_denoised:
+            x_0_pred = torch.clamp(x_0_pred, -1.0, 1.0)
+        
+        # Get alpha for previous timestep
+        if t_prev is None:
+            t_prev = torch.clamp(t - 1, min=0)
+        
+        alpha_prev = self._extract(self.alphas_cumprod, t_prev, x_t.shape)
+        
+        # DDIM forward: x_{t-1} = sqrt(alpha_{t-1}) * x_0 + sqrt(1 - alpha_{t-1}) * eps
+        # with optional stochasticity controlled by eta
+        sigma_t = eta * torch.sqrt((1 - alpha_prev) / (1 - alpha_t)) * torch.sqrt(1 - alpha_t / alpha_prev)
+        
+        # Direction pointing to x_t
+        dir_xt = torch.sqrt(1 - alpha_prev - sigma_t**2) * predicted_noise
+        
+        # Deterministic part
+        x_prev = torch.sqrt(alpha_prev) * x_0_pred + dir_xt
+        
+        # Add stochastic noise if eta > 0
+        if eta > 0:
+            noise = torch.randn_like(x_t)
+            x_prev = x_prev + sigma_t * noise
+        
+        return x_prev
+    
+    @torch.no_grad()
+    def p_sample_loop(self, denoise_fn, shape, context=None, clip_denoised=True, device=None, num_inference_steps=None, eta=0.0):
+        """
+        Generate samples using DDIM sampling with optional timestep skipping.
+        
+        Args:
+            denoise_fn: Function that predicts noise
+            shape: Shape of samples to generate
+            context: Optional context for conditional generation
+            clip_denoised: Whether to clip x_0 predictions
+            device: Device to generate on
+            num_inference_steps: Number of denoising steps (None = use all timesteps)
+            eta: DDIM stochasticity (0 = deterministic, 1 = DDPM-like)
+        
+        Returns:
+            Generated samples
+        """
+        if device is None:
+            device = self.betas.device
+        
+        batch_size = shape[0]
+        x = torch.randn(shape, device=device)
+        
+        # Create timestep schedule (supports skipping for faster inference)
+        if num_inference_steps is None or num_inference_steps >= self.num_timesteps:
+            timesteps = list(reversed(range(self.num_timesteps)))
+        else:
+            # Uniform spacing for DDIM skipping
+            step_size = self.num_timesteps // num_inference_steps
+            timesteps = list(reversed(range(0, self.num_timesteps, step_size)))
+        
+        for i, t_val in enumerate(timesteps):
+            t = torch.full((batch_size,), t_val, device=device, dtype=torch.long)
+            # Get previous timestep
+            t_prev_val = timesteps[i + 1] if i + 1 < len(timesteps) else 0
+            t_prev = torch.full((batch_size,), t_prev_val, device=device, dtype=torch.long)
+            
+            x = self.p_sample(denoise_fn, x, t, t_prev, context, clip_denoised, eta)
+        
+        return x
+    
+    def get_timestep_for_layer(self, layer_idx, num_layers):
+        """
+        Map a layer index to a diffusion timestep range.
+        Earlier layers -> higher noise (higher timesteps)
+        Later layers -> lower noise (lower timesteps)
+        """
+        layer_progress = (layer_idx + 1) / (num_layers + 1)
+        max_t = int((1.0 - layer_progress) * self.num_timesteps)
+        min_t = int((1.0 - layer_progress) * self.num_timesteps * 0.5)
+        min_t = max(min_t, 1)
+        max_t = max(max_t, min_t + 1)
+        return min_t, max_t
+
+
+class TrajectoryDenoiser(nn.Module):
+    """
+    Denoiser network that uses cross-attention with intermediate tokens
+    to predict noise for trajectory diffusion directly in flattened coordinate space.
+    Trajectory is represented as [B, N_timesteps * 2] (flattened x,y coordinates).
+    """
+    def __init__(self, 
+                 embed_dims=256,
+                 num_heads=8,
+                 num_traj_tokens=6,  # number of trajectory timesteps
+                 num_timesteps=1000,  # total diffusion timesteps for normalization
+                 dropout=0.1,
+                 ffn_dim=1024):
+        super().__init__()
+        self.embed_dims = embed_dims
+        self.num_traj_tokens = num_traj_tokens
+        self.num_timesteps = num_timesteps
+        self.traj_flat_dim = num_traj_tokens * 2  # flattened trajectory dimension
+        
+        # Input projection: project flattened noisy trajectory [B, N_timesteps*2] to [B, N_timesteps, D] for attention
+        self.input_proj = nn.Sequential(
+            nn.Linear(self.traj_flat_dim, embed_dims * num_traj_tokens),
+            nn.SiLU(),
+        )
+        
+        # Positional embedding for trajectory tokens
+        self.pos_embed = nn.Parameter(torch.randn(1, num_traj_tokens, embed_dims))
+        
+        # Time embedding
+        self.time_embed = nn.Sequential(
+            nn.Linear(embed_dims, embed_dims * 4),
+            nn.SiLU(),
+            nn.Linear(embed_dims * 4, embed_dims),
+        )
+        
+        # Cross-attention: trajectory tokens attend to context (agent/map/ego queries)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=embed_dims,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.cross_attn_norm = nn.LayerNorm(embed_dims)
+        
+        # Self-attention on trajectory tokens
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=embed_dims,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.self_attn_norm = nn.LayerNorm(embed_dims)
+        
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dims, ffn_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, embed_dims),
+            nn.Dropout(dropout),
+        )
+        self.ffn_norm = nn.LayerNorm(embed_dims)
+        
+        # Output projection: predict noise in flattened trajectory space [B, N_timesteps*2]
+        self.output_proj = nn.Sequential(
+            nn.Linear(embed_dims * num_traj_tokens, embed_dims),
+            nn.SiLU(),
+            nn.Linear(embed_dims, self.traj_flat_dim),
+        )
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def get_timestep_embedding(self, timesteps, dim):
+        """
+        Create sinusoidal timestep embeddings.
+        
+        Args:
+            timesteps: Tensor of timesteps [B] in range [0, num_timesteps-1]
+            dim: Embedding dimension
+        
+        Returns:
+            Timestep embeddings [B, dim]
+        """
+        # Normalize timesteps to [0, 1]
+        timesteps_normalized = timesteps.float() / self.num_timesteps
+        
+        half_dim = dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=timesteps.device, dtype=torch.float32) * -emb)
+        emb = timesteps_normalized[:, None] * emb[None, :]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+        if dim % 2 == 1:
+            emb = F.pad(emb, (0, 1), mode='constant')
+        return emb
+
+    def tokenize(self, noisy_traj, timesteps):
+        """Project a flattened noisy trajectory once into trajectory tokens
+        and add positional + time embeddings. Returns tokens [B, N, D].
+        """
+        B = noisy_traj.shape[0]
+        assert noisy_traj.dim() == 2 and noisy_traj.shape[1] == self.traj_flat_dim, \
+            f"noisy_traj should be [B, {self.traj_flat_dim}], got {noisy_traj.shape}"
+        assert timesteps.dim() == 1 and timesteps.shape[0] == B, \
+            f"timesteps should be [B], got {timesteps.shape}"
+
+        x = self.input_proj(noisy_traj)
+        x = x.view(B, self.num_traj_tokens, self.embed_dims)
+        # add pos and time
+        x = x + self.pos_embed
+        t_emb = self.get_timestep_embedding(timesteps, self.embed_dims)
+        t_emb = self.time_embed(t_emb)
+        x = x + t_emb.unsqueeze(1)
+        return x
+
+    def denoise_from_tokens(self, tokens, timesteps, context):
+        """Run cross-attn, self-attn and FFN on provided tokens, returning
+        (predicted_noise, updated_tokens).
+
+        - `tokens` is expected to already contain positional & time embeddings.
+        - Returns predicted_noise in flattened space [B, traj_flat_dim]
+          and the updated tokens [B, N, D].
+        """
+        B = tokens.shape[0]
+        assert tokens.dim() == 3 and tokens.shape[1] == self.num_traj_tokens and tokens.shape[2] == self.embed_dims, \
+            f"tokens must be [B, {self.num_traj_tokens}, {self.embed_dims}], got {tokens.shape}"
+        assert timesteps.dim() == 1 and timesteps.shape[0] == B, \
+            f"timesteps should be [B], got {timesteps.shape}"
+        assert context.dim() == 3 and context.shape[0] == B and context.shape[2] == self.embed_dims, \
+            f"context must be [B, N_context, {self.embed_dims}], got {context.shape}"
+
+        # Cross-attention with context
+        attn_out, _ = self.cross_attn(query=tokens, key=context, value=context)
+        x = self.cross_attn_norm(tokens + attn_out)
+
+        # Self-attention
+        self_attn_out, _ = self.self_attn(query=x, key=x, value=x)
+        x = self.self_attn_norm(x + self_attn_out)
+
+        # FFN
+        x = self.ffn_norm(x + self.ffn(x))
+
+        # Project to predicted noise
+        x_flat = x.view(B, -1)
+        predicted_noise = self.output_proj(x_flat)
+
+        return predicted_noise, x
+    
+    def forward(self, noisy_traj_or_tokens, timesteps, context):
+        """
+        Predict noise given either a flattened noisy trajectory or pre-built
+        trajectory tokens, plus context.
+
+        Args:
+            noisy_traj_or_tokens: Either
+                - flattened noisy trajectory [B, N_timesteps * 2], OR
+                - trajectory tokens [B, N_timesteps, D]
+            timesteps: Diffusion timesteps [B]
+            context: Context tokens (concatenated agent/map/ego queries) [B, N_context, D]
+
+        Returns:
+            predicted_noise: Predicted noise in flattened space [B, N_timesteps * 2]
+        """
+        B = noisy_traj_or_tokens.shape[0]
+
+        # Validate timesteps and context first
+        assert timesteps.dim() == 1 and timesteps.shape[0] == B, \
+            f"timesteps should be [B], got {timesteps.shape}"
+        assert context.dim() == 3, \
+            f"context should be 3D [B, N_context, D], got {context.shape}"
+        assert context.shape[0] == B, \
+            f"context batch size mismatch: expected {B}, got {context.shape[0]}"
+        assert context.shape[2] == self.embed_dims, \
+            f"context embed_dim mismatch: expected {self.embed_dims}, got {context.shape[2]}"
+
+        # If input is flattened trajectory, project to trajectory tokens.
+        if noisy_traj_or_tokens.dim() == 2:
+            noisy_traj = noisy_traj_or_tokens
+            assert noisy_traj.shape[1] == self.traj_flat_dim, \
+                f"noisy_traj dim mismatch: expected [B, {self.traj_flat_dim}], got {noisy_traj.shape}"
+            x = self.input_proj(noisy_traj)  # [B, N_timesteps * D]
+            x = x.view(B, self.num_traj_tokens, self.embed_dims)  # [B, N_timesteps, D]
+        elif noisy_traj_or_tokens.dim() == 3:
+            x = noisy_traj_or_tokens
+            assert x.shape[1] == self.num_traj_tokens, \
+                f"trajectory tokens length mismatch: expected {self.num_traj_tokens}, got {x.shape[1]}"
+            assert x.shape[2] == self.embed_dims, \
+                f"trajectory token embed dim mismatch: expected {self.embed_dims}, got {x.shape[2]}"
+        else:
+            raise ValueError(f"Unsupported input shape for TrajectoryDenoiser: {noisy_traj_or_tokens.shape}")
+        
+        # Add positional embedding
+        x = x + self.pos_embed
+        
+        # Get time embedding and add to trajectory
+        t_emb = self.get_timestep_embedding(timesteps, self.embed_dims)
+        t_emb = self.time_embed(t_emb)  # [B, D]
+        x = x + t_emb.unsqueeze(1)  # [B, N_timesteps, D]
+        
+        # Cross-attention with context
+        attn_out, _ = self.cross_attn(
+            query=x,
+            key=context,
+            value=context
+        )
+        x = self.cross_attn_norm(x + attn_out)
+        
+        # Self-attention
+        self_attn_out, _ = self.self_attn(
+            query=x,
+            key=x,
+            value=x
+        )
+        x = self.self_attn_norm(x + self_attn_out)
+        
+        # FFN
+        x = self.ffn_norm(x + self.ffn(x))
+        
+        # Flatten and project back to flattened trajectory space
+        x = x.view(B, -1)  # [B, N_timesteps * D]
+        predicted_noise = self.output_proj(x)  # [B, N_timesteps * 2]
+        
+        # Output shape assertion
+        assert predicted_noise.shape == (B, self.traj_flat_dim), \
+            f"predicted_noise shape mismatch: expected {(B, self.traj_flat_dim)}, got {predicted_noise.shape}"
+        
+        return predicted_noise
+
+
 @HEADS.register_module()
 class DriveTransformerlHead(BaseModule):
     """
@@ -100,6 +597,17 @@ class DriveTransformerlHead(BaseModule):
         loss_plan_reg_fix_time=None,
         loss_plan_reg_fix_dist=None,
         loss_plan_cls=None,
+        ## Diffusion Loss
+        use_diffusion_loss=False,
+        diffusion_loss_weight=1.0,
+        diffusion_num_timesteps=1000,
+        diffusion_beta_start=0.0001,
+        diffusion_beta_end=0.02,
+        diffusion_schedule_type='linear',  # 'linear', 'cosine', or 'quadratic'
+        diffusion_loss_type='mse',  # 'mse' or 'l1'
+        diffusion_num_traj_tokens=6,  # Number of trajectory tokens for denoiser
+        diffusion_num_heads=8,
+        diffusion_ffn_dim=1024,
         ## Cfg
         train_cfg=None,
         test_cfg=None,
@@ -276,6 +784,24 @@ class DriveTransformerlHead(BaseModule):
         self.loss_plan_reg_fix_dist = build_loss(loss_plan_reg_fix_dist)
         self.loss_plan_reg_fix_time = build_loss(loss_plan_reg_fix_time)
         self.loss_plan_cls = build_loss(loss_plan_cls)
+        ## Diffusion Loss
+        self.use_diffusion_loss = use_diffusion_loss
+        self.diffusion_loss_weight = diffusion_loss_weight
+        self.diffusion_loss_type = diffusion_loss_type
+        self.diffusion_num_traj_tokens = diffusion_num_traj_tokens
+        self.diffusion_num_timesteps = diffusion_num_timesteps
+        self.diffusion_num_heads = diffusion_num_heads
+        self.diffusion_ffn_dim = diffusion_ffn_dim
+        if use_diffusion_loss:
+            # Initialize diffusion scheduler
+            self.diffusion_scheduler = DiffusionScheduler(
+                num_timesteps=diffusion_num_timesteps,
+                beta_start=diffusion_beta_start,
+                beta_end=diffusion_beta_end,
+                schedule_type=diffusion_schedule_type
+            )
+            # Trajectory denoisers will be initialized in init_output_head
+            # after transformer.decoder.num_layers is available
         ## Bench2Drive
         self.ego_command_dim = ego_command_dim
         self.num_query = self.agent_num_query + self.map_num_query
@@ -478,6 +1004,19 @@ class DriveTransformerlHead(BaseModule):
         self.ego_traj_branches_fix_dist = _get_clones(ego_traj_branch_fix_dist, ego_num_pred) if self.fut_ego_fix_dist else None
         self.ego_traj_branches_fix_time = _get_clones(ego_traj_branch_fix_time, ego_num_pred)
         self.ego_traj_cls_branches = _get_clones(ego_traj_cls_branch, ego_num_pred) if self.ego_multi_modal else None
+        
+        # Create trajectory denoisers - one per decoder layer for iterative refinement
+        if self.use_diffusion_loss:
+            trajectory_denoiser = TrajectoryDenoiser(
+                embed_dims=self.embed_dims,
+                num_heads=self.diffusion_num_heads,
+                num_traj_tokens=self.diffusion_num_traj_tokens,
+                num_timesteps=self.diffusion_num_timesteps,
+                dropout=0.1,
+                ffn_dim=self.diffusion_ffn_dim
+            )
+            # create one denoiser per decoder layer PLUS the initial token state
+            self.trajectory_denoisers = _get_clones(trajectory_denoiser, num_mixed_up_layers + 1)
     
     def xavier_uniform_linear(self, m):
         is_linear_layer = any([isinstance(m, nn.Linear), isinstance(m, nn.Conv2d), isinstance(m, nn.ConvTranspose2d)])
@@ -649,10 +1188,12 @@ class DriveTransformerlHead(BaseModule):
             ego_traj_branches_fix_dist=self.ego_traj_branches_fix_dist,
             ego_traj_branches_fix_time=self.ego_traj_branches_fix_time,
             ego_traj_cls_branches=self.ego_traj_cls_branches,
+            return_intermediate_queries=True,
         )
         # collect results
         agent_traj_coords, agent_traj_cls, agent_coords_bev, agent_coords, agent_class, map_pts_coords, map_class, \
-        ego_traj_fix_time, ego_traj_fix_dist, ego_traj_cls = list(map(lambda x: torch.stack(x) if not (x is None or x[0] is None) else None, results)) #
+        ego_traj_fix_time, ego_traj_fix_dist, ego_traj_cls, intermediate_agent_query, intermediate_map_query, intermediate_ego_query = \
+            list(map(lambda x: torch.stack(x) if not (x is None or x[0] is None) else None, results))
         map_boxes, map_refs = map_transform_box(map_pts_coords)
         # add current feature to memory
         self.post_update_memory(data, rec_ego_pose, agent_class, agent_coords, \
@@ -685,6 +1226,9 @@ class DriveTransformerlHead(BaseModule):
             'map_pre_pts_coord_preds': map_prep_pts_coord, # [B, N_map_query, N_pts_per_line, 2]
             'agent_pre_cls_scores': agent_prep_class, # [B, N_agent_query, N_object_type]
             'agent_pre_coord_preds': agent_prep_ref, # [B, N_agent_query, C_box]
+            'intermediate_agent_query': intermediate_agent_query, # [N_layers+1, B, N_agent_query, D] (includes initial)
+            'intermediate_map_query': intermediate_map_query, # [N_layers+1, B, N_map_query, D] (includes initial)
+            'intermediate_ego_query': intermediate_ego_query, # [N_layers+1, B, N_ego_mode, D] (includes initial)
         }
         return outs
         
@@ -1298,6 +1842,232 @@ class DriveTransformerlHead(BaseModule):
                 )    
                 loss_plan_cls_list.append(loss_plan_cls)
         return loss_plan_reg_fix_time_list, loss_plan_reg_fix_dist_list, loss_plan_cls_list
+
+    def loss_diffusion(self, 
+                       intermediate_agent_query,
+                       intermediate_map_query,
+                       intermediate_ego_query,
+                       ego_fut_gt=None,
+                       ego_fut_mask=None):
+        """
+        Compute diffusion loss using trajectory tokens with cross-attention.
+        
+        Creates trajectory tokens that attend to all intermediate query tokens
+        at each decoder layer, using the diffusion scheduler for forward/reverse
+        process and the trajectory denoiser for noise prediction.
+        
+        Args:
+            intermediate_agent_query: [N_layers+1, B, N_agent_query, D]
+            intermediate_map_query: [N_layers+1, B, N_map_query, D]  
+            intermediate_ego_query: [N_layers+1, B, N_ego_mode, D]
+            ego_fut_gt: Ground truth ego future trajectory [B, N_future_time, 2]
+            ego_fut_mask: Mask for valid trajectory points [B, N_future_time]
+        
+        Returns:
+            loss_diffusion: Scalar diffusion loss
+        """
+        if not self.use_diffusion_loss:
+            return None
+        
+        # Check if we have valid queries and GT trajectory
+        if intermediate_ego_query is None:
+            return None
+        
+        if ego_fut_gt is None:
+            return None
+        
+        # Get dimensions
+        num_layers_plus_one = intermediate_ego_query.shape[0]
+        # include the initial token state so we iterate over all available
+        # intermediate query states (initial + decoder layer outputs)
+        num_layers = num_layers_plus_one
+        if num_layers < 1:
+            return None
+        
+        batch_size = intermediate_ego_query.shape[1]
+        device = intermediate_ego_query.device
+        
+        # Shape assertions for intermediate queries
+        assert intermediate_ego_query.dim() == 4, \
+            f"intermediate_ego_query should be 4D [N_layers+1, B, N_ego_mode, D], got {intermediate_ego_query.shape}"
+        assert intermediate_ego_query.shape[-1] == self.embed_dims, \
+            f"intermediate_ego_query embed_dim mismatch: expected {self.embed_dims}, got {intermediate_ego_query.shape[-1]}"
+        
+        if intermediate_agent_query is not None:
+            assert intermediate_agent_query.dim() == 4, \
+                f"intermediate_agent_query should be 4D [N_layers+1, B, N_agent, D], got {intermediate_agent_query.shape}"
+            assert intermediate_agent_query.shape[0] == num_layers_plus_one, \
+                f"intermediate_agent_query num_layers mismatch: expected {num_layers_plus_one}, got {intermediate_agent_query.shape[0]}"
+            assert intermediate_agent_query.shape[1] == batch_size, \
+                f"intermediate_agent_query batch_size mismatch: expected {batch_size}, got {intermediate_agent_query.shape[1]}"
+        
+        if intermediate_map_query is not None:
+            assert intermediate_map_query.dim() == 4, \
+                f"intermediate_map_query should be 4D [N_layers+1, B, N_map, D], got {intermediate_map_query.shape}"
+            assert intermediate_map_query.shape[0] == num_layers_plus_one, \
+                f"intermediate_map_query num_layers mismatch: expected {num_layers_plus_one}, got {intermediate_map_query.shape[0]}"
+            assert intermediate_map_query.shape[1] == batch_size, \
+                f"intermediate_map_query batch_size mismatch: expected {batch_size}, got {intermediate_map_query.shape[1]}"
+        
+        # Shape assertions for GT trajectory
+        assert ego_fut_gt.dim() == 3, \
+            f"ego_fut_gt should be 3D [B, N_time, 2], got shape {ego_fut_gt.shape}"
+        assert ego_fut_gt.shape[0] == batch_size, \
+            f"ego_fut_gt batch_size mismatch: expected {batch_size}, got {ego_fut_gt.shape[0]}"
+        assert ego_fut_gt.shape[2] == 2, \
+            f"ego_fut_gt should have 2 coords (x,y), got {ego_fut_gt.shape[2]}"
+        
+        # Use the ground truth trajectory as the clean target
+        # ego_fut_gt shape: [B, N_future_time, 2]
+        # Flatten to [B, N_future_time * 2] for diffusion
+        clean_traj = ego_fut_gt.to(device).float()  # [B, N_future_time, 2]
+        
+        # Handle shape: interpolate if needed, then flatten
+        if clean_traj.shape[1] != self.diffusion_num_traj_tokens:
+            clean_traj = clean_traj.permute(0, 2, 1)  # [B, 2, N_future_time]
+            clean_traj = F.interpolate(clean_traj, size=self.diffusion_num_traj_tokens, mode='linear', align_corners=True)
+            clean_traj = clean_traj.permute(0, 2, 1)  # [B, N_traj_tokens, 2]
+        
+        # Flatten trajectory: [B, N_traj_tokens, 2] -> [B, N_traj_tokens * 2]
+        clean_traj = clean_traj.flatten(-2)  # [B, N_traj_tokens * 2]
+        
+        # Assert final clean_traj shape
+        assert clean_traj.shape == (batch_size, self.diffusion_num_traj_tokens * 2), \
+            f"clean_traj shape mismatch: expected {(batch_size, self.diffusion_num_traj_tokens * 2)}, got {clean_traj.shape}"
+        
+        # Sample a single timestep for all layers (same t for iterative refinement)
+        t = torch.randint(0, self.diffusion_num_timesteps, (batch_size,), device=device)
+        
+        # Assert timestep shape
+        assert t.shape == (batch_size,), f"timestep shape mismatch: expected {(batch_size,)}, got {t.shape}"
+        
+        # Forward diffusion: add noise to clean flattened trajectory
+        noisy_traj, noise = self.diffusion_scheduler.q_sample(clean_traj, t)
+        
+        # Assert noisy_traj and noise shapes
+        assert noisy_traj.shape == clean_traj.shape, \
+            f"noisy_traj shape mismatch: expected {clean_traj.shape}, got {noisy_traj.shape}"
+        assert noise.shape == clean_traj.shape, \
+            f"noise shape mismatch: expected {clean_traj.shape}, got {noise.shape}"
+        
+        layer_losses = []
+        
+        # Initialize noise prediction with zeros (like initial prediction in decoder)
+        predicted_noise_cumulative = torch.zeros_like(noisy_traj)
+
+        # Tokenize once from the noisy flattened trajectory and timestep
+        tokens = self.trajectory_denoisers[0].tokenize(noisy_traj, t)
+
+        # For each intermediate layer, iteratively refine the denoising prediction
+        for layer_idx in range(num_layers):
+            # Get intermediate queries at this layer
+            agent_query_tokens_at_layer = intermediate_agent_query[layer_idx] if intermediate_agent_query is not None else None
+            map_query_tokens_at_layer = intermediate_map_query[layer_idx] if intermediate_map_query is not None else None
+            ego_query_tokens_at_layer = intermediate_ego_query[layer_idx]
+            
+            # Assert layer query shapes
+            assert ego_query_tokens_at_layer.dim() == 3, \
+                f"ego_query_tokens_at_layer should be 3D [B, N_ego, D], got {ego_query_tokens_at_layer.shape}"
+            
+            # Concatenate all queries to form context for cross-attention
+            # Context: [B, N_agent + N_map + N_ego, D]
+            context_list = []
+            if agent_query_tokens_at_layer is not None:
+                context_list.append(agent_query_tokens_at_layer)
+            if map_query_tokens_at_layer is not None:
+                context_list.append(map_query_tokens_at_layer)
+            context_list.append(ego_query_tokens_at_layer)
+            context = torch.cat(context_list, dim=1)  # [B, N_context, D]
+            
+            # Assert context shape
+            assert context.dim() == 3, f"context should be 3D [B, N_context, D], got {context.shape}"
+            assert context.shape[0] == batch_size, f"context batch_size mismatch"
+            assert context.shape[2] == self.embed_dims, f"context embed_dim mismatch"
+            
+            # Use layer-specific trajectory denoiser to predict noise delta with cross-attention to context
+            # `denoise_from_tokens` returns (predicted_noise_delta, updated_tokens)
+            predicted_noise_delta, tokens = self.trajectory_denoisers[layer_idx].denoise_from_tokens(tokens, t, context)
+
+            # Iterative refinement: add delta to cumulative prediction (like decoder layers)
+            # This mirrors how DriveTransformer refines predictions: new_pred = old_pred + delta
+            predicted_noise_cumulative = predicted_noise_cumulative + predicted_noise_delta
+            
+            # Assert predicted_noise shape
+            assert predicted_noise_cumulative.shape == noise.shape, \
+                f"predicted_noise_cumulative shape mismatch: expected {noise.shape}, got {predicted_noise_cumulative.shape}"
+            
+            # Compute loss between cumulative prediction and actual noise
+            if self.diffusion_loss_type == 'mse':
+                loss = F.mse_loss(predicted_noise_cumulative, noise, reduction='mean')
+            elif self.diffusion_loss_type == 'l1':
+                loss = F.l1_loss(predicted_noise_cumulative, noise, reduction='mean')
+            else:
+                raise ValueError(f"Unknown diffusion loss type: {self.diffusion_loss_type}")
+            
+            layer_losses.append(loss)
+        
+        if len(layer_losses) == 0:
+            return None
+        
+        # Average across layers and apply weight
+        total_loss = torch.stack(layer_losses).mean() * self.diffusion_loss_weight
+        return torch.nan_to_num(total_loss)
+    
+    @torch.no_grad()
+    def diffusion_sample(self, 
+                         intermediate_agent_query,
+                         intermediate_map_query,
+                         intermediate_ego_query,
+                         num_steps=None):
+        """
+        Generate trajectory samples using the reverse diffusion process.
+        Operates in flattened coordinate space [B, N_timesteps * 2].
+        
+        Args:
+            intermediate_agent_query: [N_layers+1, B, N_agent_query, D]
+            intermediate_map_query: [N_layers+1, B, N_map_query, D]
+            intermediate_ego_query: [N_layers+1, B, N_ego_mode, D]
+            num_steps: Number of denoising steps (default: all timesteps)
+        
+        Returns:
+            sampled_traj: Generated trajectory coordinates [B, N_timesteps * 2] (flattened)
+        """
+        if not self.use_diffusion_loss:
+            return None
+        
+        batch_size = intermediate_ego_query.shape[1]
+        device = intermediate_ego_query.device
+        num_layers = len(self.trajectory_denoisers)
+        
+        # Use final layer queries as context
+        agent_query = intermediate_agent_query[-1] if intermediate_agent_query is not None else None
+        map_query = intermediate_map_query[-1] if intermediate_map_query is not None else None
+        ego_query = intermediate_ego_query[-1]
+        
+        # Build context
+        context_list = []
+        if agent_query is not None:
+            context_list.append(agent_query)
+        if map_query is not None:
+            context_list.append(map_query)
+        context_list.append(ego_query)
+        context = torch.cat(context_list, dim=1)
+        
+        # Define denoising function that uses the final layer's denoiser
+        def denoise_fn(x_t, t):
+            return self.trajectory_denoisers[-1](x_t, t, context)
+        
+        # Generate samples in flattened coordinate space [B, N_timesteps * 2]
+        shape = (batch_size, self.diffusion_num_traj_tokens * 2)
+        sampled_traj = self.diffusion_scheduler.p_sample_loop(
+            denoise_fn=denoise_fn,
+            shape=shape,
+            context=context,
+            clip_denoised=False,
+            device=device
+        )
+        
+        return sampled_traj
     
     def loss_single(self,
                     cls_scores,
@@ -1816,6 +2586,21 @@ class DriveTransformerlHead(BaseModule):
             loss_dict[f'd{num_dec_layer}.loss_map_pts'] = map_loss_pts_i
             loss_dict[f'd{num_dec_layer}.loss_map_dir'] = map_loss_dir_i
             num_dec_layer += 1
+        
+        # Diffusion Loss on intermediate queries
+        if self.use_diffusion_loss:
+            intermediate_agent_query = preds_dicts.get('intermediate_agent_query', None)
+            intermediate_map_query = preds_dicts.get('intermediate_map_query', None)
+            intermediate_ego_query = preds_dicts.get('intermediate_ego_query', None)
+            loss_diffusion = self.loss_diffusion(
+                intermediate_agent_query,
+                intermediate_map_query,
+                intermediate_ego_query,
+                ego_fut_gt=ego_fut_gt_fix_time,  # [B, N_future_time, 2]
+                ego_fut_mask=ego_fut_masks_fix_time  # [B, N_future_time]
+            )
+            if loss_diffusion is not None:
+                loss_dict['loss_diffusion'] = loss_diffusion
         
         return loss_dict
     

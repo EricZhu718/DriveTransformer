@@ -825,6 +825,7 @@ class DriveTransformerDecoder(TransformerLayerSequence):
             ego_traj_branches_fix_dist=None, # regression head for planning (fixed distance interval form)
             ego_traj_branches_fix_time=None, # regression head for planning (fixed time interval form)
             ego_traj_cls_branches=None, # classification head for planning
+            return_intermediate_queries=False, # flag to return intermediate queries
         ):
         bs = agent_query.shape[0]
         intermediate_agent_traj_coords = []
@@ -837,6 +838,9 @@ class DriveTransformerDecoder(TransformerLayerSequence):
         intermediate_ego_traj_fix_dist = []
         intermediate_ego_traj_fix_time = []
         intermediate_ego_class = []
+        intermediate_agent_query = [agent_query] if return_intermediate_queries else []
+        intermediate_map_query = [map_query] if return_intermediate_queries else []
+        intermediate_ego_query = [ego_query] if return_intermediate_queries else []
         cur_agent_pred = agent_ref.clone()
         agent_ref = agent_ref[..., [0, 1, 4]] #(x,y,z)
         for lid, layer in enumerate(self.layers):
@@ -855,6 +859,11 @@ class DriveTransformerDecoder(TransformerLayerSequence):
             agent_query, map_query, ego_query = layer(agent_query, map_query, ego_query, img_feats, img_pos_embed, 
                 agent_temp_memory, agent_temp_pos, map_temp_memory, map_temp_pos, ego_temp_memory, ego_temp_pos,
                 agent_pos_cls_embed, map_pts_pos_embed, map_ins_pos_embed, ego_pos_embed, attn_mask, temp_attn_masks=temp_attn_masks)
+            # store intermediate queries
+            if return_intermediate_queries:
+                intermediate_agent_query.append(agent_query)
+                intermediate_map_query.append(map_query)
+                intermediate_ego_query.append(ego_query)
             # task heads
             # detection 
             agent_cls = cls_branches[lid](agent_query) 
@@ -898,18 +907,35 @@ class DriveTransformerDecoder(TransformerLayerSequence):
             intermediate_ego_traj_fix_dist.append(ego_traj_ref_fix_dist)
             intermediate_ego_class.append(ego_traj_cls)
 
-        return agent_query, map_query, ego_query, \
-            (intermediate_agent_traj_coords,
-            intermediate_agent_traj_cls,
-            intermediate_agent_coords_bev,
-            intermediate_agent_coords,
-            intermediate_agent_class,
-            intermediate_map_coords,
-            intermediate_map_class,
-            intermediate_ego_traj_fix_time,
-            intermediate_ego_traj_fix_dist,
-            intermediate_ego_class
-            )
+        if return_intermediate_queries:
+            return agent_query, map_query, ego_query, \
+                (intermediate_agent_traj_coords,
+                intermediate_agent_traj_cls,
+                intermediate_agent_coords_bev,
+                intermediate_agent_coords,
+                intermediate_agent_class,
+                intermediate_map_coords,
+                intermediate_map_class,
+                intermediate_ego_traj_fix_time,
+                intermediate_ego_traj_fix_dist,
+                intermediate_ego_class,
+                intermediate_agent_query,
+                intermediate_map_query,
+                intermediate_ego_query
+                )
+        else:
+            return agent_query, map_query, ego_query, \
+                (intermediate_agent_traj_coords,
+                intermediate_agent_traj_cls,
+                intermediate_agent_coords_bev,
+                intermediate_agent_coords,
+                intermediate_agent_class,
+                intermediate_map_coords,
+                intermediate_map_class,
+                intermediate_ego_traj_fix_time,
+                intermediate_ego_traj_fix_dist,
+                intermediate_ego_class
+                )
             
 @TRANSFORMER.register_module()
 class DriveTransformerWrapper(BaseModule):
