@@ -132,8 +132,8 @@ map_num_topk_sift = 100
 map_num_propagated = 50
 memory_len_frame = 10
 num_mode = 6
-num_gpus = 8
-batch_size = 10
+num_gpus = 4
+batch_size = 1
 num_iters_per_epoch = 200000 // (num_gpus * batch_size)
 
 data_aug_conf = {

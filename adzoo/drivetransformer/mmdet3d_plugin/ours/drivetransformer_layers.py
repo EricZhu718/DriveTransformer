@@ -856,14 +856,9 @@ class DriveTransformerDecoder(TransformerLayerSequence):
             map_ins_pos_embed = map_ins_pos_embed + map_class_embed
             map_pts_pos_embed = (map_ref_embedding(pos2posemb(map_pts_coord.detach(), self.embed_dims//2)) + map_class_embed.unsqueeze(-2)).flatten(1, 2)
             # major attention layer: task self attention, temporal cross attention, sensor cross attention
-            agent_query, map_query, ego_query = layer(agent_query, map_query, ego_query, img_feats, img_pos_embed, 
+            agent_query, map_query, ego_query = layer(agent_query, map_query, ego_query, img_feats, img_pos_embed,
                 agent_temp_memory, agent_temp_pos, map_temp_memory, map_temp_pos, ego_temp_memory, ego_temp_pos,
                 agent_pos_cls_embed, map_pts_pos_embed, map_ins_pos_embed, ego_pos_embed, attn_mask, temp_attn_masks=temp_attn_masks)
-            # store intermediate queries
-            if return_intermediate_queries:
-                intermediate_agent_query.append(agent_query)
-                intermediate_map_query.append(map_query)
-                intermediate_ego_query.append(ego_query)
             # task heads
             # detection 
             agent_cls = cls_branches[lid](agent_query) 
@@ -896,7 +891,7 @@ class DriveTransformerDecoder(TransformerLayerSequence):
             map_cls = map_cls_branches[lid](map_query)
             intermediate_map_class.append(map_cls)
             # planning
-            if self.refine: 
+            if self.refine:
                 ego_traj_ref_fix_dist = ego_traj_branches_fix_dist[lid](ego_query + ego_pos_embed).unsqueeze(-1) + ego_traj_ref_fix_dist if ego_traj_branches_fix_dist is not None else None
                 ego_traj_ref_fix_time = ego_traj_branches_fix_time[lid](ego_query + ego_pos_embed).reshape(bs,ego_query.shape[1], -1, 2) + ego_traj_ref_fix_time
             else:
@@ -906,6 +901,11 @@ class DriveTransformerDecoder(TransformerLayerSequence):
             intermediate_ego_traj_fix_time.append(ego_traj_ref_fix_time)
             intermediate_ego_traj_fix_dist.append(ego_traj_ref_fix_dist)
             intermediate_ego_class.append(ego_traj_cls)
+            # store intermediate queries
+            if return_intermediate_queries:
+                intermediate_agent_query.append(agent_query)
+                intermediate_map_query.append(map_query)
+                intermediate_ego_query.append(ego_query)
 
         if return_intermediate_queries:
             return agent_query, map_query, ego_query, \

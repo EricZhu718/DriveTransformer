@@ -77,6 +77,84 @@ def fuse_conv_bn(module: nn.Module) -> nn.Module:
     return module
 
 
+# Added by Claude Code
+def load_checkpoint_partial(checkpoint_path: str, model: nn.Module, logger=None):
+    """Load checkpoint with partial key matching.
+
+    This function loads weights from a checkpoint, only loading keys that exist
+    in both the checkpoint and the model. Useful when:
+    - Loading checkpoint without diffusion_head into model with diffusion_head
+    - Loading checkpoint with diffusion_head into model without diffusion_head
+
+    Args:
+        checkpoint_path: Path to checkpoint file
+        model: The model to load weights into
+        logger: Optional logger for printing information
+
+    Returns:
+        None (loads weights in-place into model)
+    """
+    if logger:
+        logger.info(f"Loading checkpoint from: {checkpoint_path}")
+
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint_state = checkpoint["state_dict"]
+
+    # Get model state dict
+    model_state = model.state_dict()
+
+    # Find matching keys
+    checkpoint_keys = set(checkpoint_state.keys())
+    model_keys = set(model_state.keys())
+
+    matching_keys = checkpoint_keys & model_keys
+    missing_in_checkpoint = model_keys - checkpoint_keys
+    missing_in_model = checkpoint_keys - model_keys
+
+    # Load matching weights
+    loaded_state = {k: checkpoint_state[k] for k in matching_keys}
+    model.load_state_dict(loaded_state, strict=False)
+
+    # Log results
+    if logger:
+        logger.info(f"Successfully loaded {len(matching_keys)}/{len(checkpoint_keys)} keys from checkpoint")
+
+        # Group missing keys by whether they're diffusion-related
+        diffusion_missing_in_ckpt = [k for k in missing_in_checkpoint if 'diffusion' in k.lower()]
+        diffusion_missing_in_model = [k for k in missing_in_model if 'diffusion' in k.lower()]
+        other_missing_in_ckpt = [k for k in missing_in_checkpoint if 'diffusion' not in k.lower()]
+        other_missing_in_model = [k for k in missing_in_model if 'diffusion' not in k.lower()]
+
+        if diffusion_missing_in_ckpt:
+            logger.info(f"\nModel has {len(diffusion_missing_in_ckpt)} diffusion keys not in checkpoint (will use initialized weights):")
+            for k in sorted(diffusion_missing_in_ckpt)[:5]:
+                logger.info(f"  - {k}")
+            if len(diffusion_missing_in_ckpt) > 5:
+                logger.info(f"  ... and {len(diffusion_missing_in_ckpt) - 5} more")
+
+        if diffusion_missing_in_model:
+            logger.info(f"\nCheckpoint has {len(diffusion_missing_in_model)} diffusion keys not in model (skipped):")
+            for k in sorted(diffusion_missing_in_model)[:5]:
+                logger.info(f"  - {k}")
+            if len(diffusion_missing_in_model) > 5:
+                logger.info(f"  ... and {len(diffusion_missing_in_model) - 5} more")
+
+        if other_missing_in_ckpt:
+            logger.warning(f"\nWARNING: Model has {len(other_missing_in_ckpt)} non-diffusion keys not in checkpoint:")
+            for k in sorted(other_missing_in_ckpt)[:10]:
+                logger.warning(f"  - {k}")
+            if len(other_missing_in_ckpt) > 10:
+                logger.warning(f"  ... and {len(other_missing_in_ckpt) - 10} more")
+
+        if other_missing_in_model:
+            logger.warning(f"\nWARNING: Checkpoint has {len(other_missing_in_model)} non-diffusion keys not in model:")
+            for k in sorted(other_missing_in_model)[:10]:
+                logger.warning(f"  - {k}")
+            if len(other_missing_in_model) > 10:
+                logger.warning(f"  ... and {len(other_missing_in_model) - 10} more")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
     parser.add_argument('config', help='train config file path')
@@ -104,6 +182,10 @@ def parse_args():
         '--remove_orig_mod',
         action='store_true',
         help='Whether to remove orig_mod in model_dict')
+    parser.add_argument(
+        '--partial-load',
+        action='store_true',
+        help='Load checkpoint with partial key matching (useful when checkpoint and model have different modules like diffusion_head)')
     group_gpus = parser.add_mutually_exclusive_group()
     group_gpus.add_argument(
         '--gpus',
@@ -362,8 +444,12 @@ def main():
             torch.save(remapped_checkpoint, str(cfg.load_from[:-4])+"_remapped.pth")
             cfg.load_from = str(cfg.load_from[:-4])+"_remapped.pth"
             print("Remap checkpoint to", str(args.load_from))
-        
-        runner.load_checkpoint(cfg.load_from)
+
+        # Added by Claude Code: Use partial loading if requested
+        if args.partial_load:
+            load_checkpoint_partial(cfg.load_from, model, logger)
+        else:
+            runner.load_checkpoint(cfg.load_from)
     
     if args.compile_after:
         model.module.img_backbone = torch.compile(model.module.img_backbone, dynamic=False)
