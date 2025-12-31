@@ -124,14 +124,8 @@ class DriveTransformerAgent(autonomous_agent.AutonomousAgent):
             self.save_path = pathlib.Path(os.environ['SAVE_PATH']) / string
             self.save_path.mkdir(parents=True, exist_ok=False)
 
-            (self.save_path / 'rgb_front').mkdir()
-            # (self.save_path / 'rgb_front_right').mkdir()
-            # (self.save_path / 'rgb_front_left').mkdir()
-            # (self.save_path / 'rgb_back').mkdir()
-            # (self.save_path / 'rgb_back_right').mkdir()
-            # (self.save_path / 'rgb_back_left').mkdir()
+            (self.save_path / 'combined').mkdir()
             (self.save_path / 'meta').mkdir()
-            (self.save_path / 'bev').mkdir()
 
         # transform from lidar to image coordinates
         self.lidar2img = {
@@ -533,23 +527,9 @@ class DriveTransformerAgent(autonomous_agent.AutonomousAgent):
             # Handle both (N, 6) and (1, N, 6) shapes
             if agent_traj_cls_scores.ndim == 3:
                 agent_traj_cls_scores = agent_traj_cls_scores[0]  # (N, 6)
-            
-            # Debug: print shapes and values to verify
-            print(f"\n[DEBUG] === Step {self.step} Agent Trajectory Classification Scores ===")
-            print(f"[DEBUG] agent_traj_cls_scores shape: {agent_traj_cls_scores.shape}")
-            print(f"[DEBUG] agent_traj_cls_scores dtype: {agent_traj_cls_scores.dtype}")
-            if len(agent_traj_cls_scores) > 0:
-                print(f"[DEBUG] Score range: [{agent_traj_cls_scores.min():.4f}, {agent_traj_cls_scores.max():.4f}]")
-                print(f"[DEBUG] First 3 agents' scores:")
-                for i in range(min(3, len(agent_traj_cls_scores))):
-                    print(f"[DEBUG]   Agent {i}: {agent_traj_cls_scores[i]}")
-                print(f"[DEBUG] Score std per agent (first 5): {[agent_traj_cls_scores[i].std() for i in range(min(5, len(agent_traj_cls_scores)))]}")
-            
+
             # Get best mode for each agent
             best_modes = np.argmax(agent_traj_cls_scores, axis=1)  # (N,)
-            print(f"[DEBUG] best_modes (first 10): {best_modes[:10] if len(best_modes) > 10 else best_modes}")
-            print(f"[DEBUG] best_modes distribution: {np.bincount(best_modes)}")
-            print(f"[DEBUG] ============================================\n")
             
             # Helper function to convert ego coordinates to BEV pixel coordinates
             def ego_to_pixel(coords_xy):
@@ -572,32 +552,43 @@ class DriveTransformerAgent(autonomous_agent.AutonomousAgent):
                 pixel_coords = pixel_coords[:, [1, 0]]
                 return pixel_coords[:, :2]
             
-            # Create visualization with BEV image
-            fig, ax = plt.subplots(figsize=(12, 12))
-            
+            # Create visualization with BEV and front camera side by side
+            fig, (ax_bev, ax_front) = plt.subplots(1, 2, figsize=(24, 12))
+
+            # LEFT SUBPLOT: BEV with agent predictions
             # Display BEV image as background (512x512 pixels)
             # Flip image vertically so forward points up
             bev_img = np.flipud(tick_data['bev'])
-            ax.imshow(bev_img, extent=[0, 512, 0, 512], origin='lower', alpha=1.0)
-            
-            ax.set_xlim(-50, 562)
-            ax.set_ylim(-50, 562)
-            ax.set_aspect('equal')
-            ax.grid(True, alpha=0.3, color='white', linewidth=0.5)
-            ax.set_xlabel('X (left, pixels)', fontsize=12, color='white')
-            ax.set_ylabel('Y (forward, pixels)', fontsize=12, color='white')
-            ax.set_title(f'Agent Predictions with Best Trajectory Modes (Step {self.step})', fontsize=14, color='white')
-            ax.tick_params(colors='white')
-            
+            ax_bev.imshow(bev_img, extent=[0, 512, 0, 512], origin='lower', alpha=1.0)
+
+            ax_bev.set_xlim(-50, 562)
+            ax_bev.set_ylim(-50, 562)
+            ax_bev.set_aspect('equal')
+            ax_bev.grid(True, alpha=0.3, color='white', linewidth=0.5)
+            ax_bev.set_xlabel('X (left, pixels)', fontsize=12, color='white')
+            ax_bev.set_ylabel('Y (forward, pixels)', fontsize=12, color='white')
+            ax_bev.set_title(f'BEV with Agent Predictions (Step {self.step})', fontsize=14, color='white')
+            ax_bev.tick_params(colors='white')
+
+            # RIGHT SUBPLOT: Front camera
+            ax_front.imshow(tick_data['imgs']['CAM_FRONT'])
+            ax_front.axis('off')
+            ax_front.set_title('Front Camera', fontsize=14, color='white')
+
             # Enable clipping to prevent labels from being cut off
             plt.rcParams['text.usetex'] = False
             fig.tight_layout(pad=2.0)
+
+            # Set black background for entire figure
+            fig.patch.set_facecolor('black')
+            ax_bev.set_facecolor('black')
+            ax_front.set_facecolor('black')
             
             # Plot ego vehicle at origin (convert 0,0 in ego frame to pixels)
             ego_pixel = ego_to_pixel(np.array([[0, 0]]))[0]
             ego_circle = Circle(ego_pixel, 10, color='lime', alpha=0.7, linewidth=2, fill=False, label='Ego Vehicle')
-            ax.add_patch(ego_circle)
-            ax.plot(ego_pixel[0], ego_pixel[1], 'g*', markersize=20, markeredgecolor='white', markeredgewidth=1)
+            ax_bev.add_patch(ego_circle)
+            ax_bev.plot(ego_pixel[0], ego_pixel[1], 'g*', markersize=20, markeredgecolor='white', markeredgewidth=1)
             
             # Plot lane centerlines if available
             if 'map_pts_3d' in output_data_batch[0]:
@@ -622,9 +613,9 @@ class DriveTransformerAgent(autonomous_agent.AutonomousAgent):
                     
                     label_idx = int(map_labels[i])
                     color = map_colors.get(label_idx, 'gray')
-                    
+
                     # Plot lane as connected line
-                    ax.plot(lane_pixels[:, 0], lane_pixels[:, 1], '-', color=color, 
+                    ax_bev.plot(lane_pixels[:, 0], lane_pixels[:, 1], '-', color=color,
                            linewidth=2, alpha=0.7, linestyle='--')
             
             # Color map for different agent classes
@@ -673,21 +664,21 @@ class DriveTransformerAgent(autonomous_agent.AutonomousAgent):
                 
                 # Convert corners to pixels
                 corners_pixels = ego_to_pixel(corners_ego)
-                
+
                 # Draw bounding box
-                ax.plot(corners_pixels[:, 0], corners_pixels[:, 1], '-', color=color, linewidth=2, alpha=0.8)
+                ax_bev.plot(corners_pixels[:, 0], corners_pixels[:, 1], '-', color=color, linewidth=2, alpha=0.8)
                 
                 # Plot predicted velocity as arrow from agent center
                 agent_pixel = ego_to_pixel(np.array([[x, y]]))[0]
                 scale = 10.0  # Scale velocity for visualization (1 m/s = 10 pixels)
                 vel_end_pos = np.array([[x + vx * scale, y + vy * scale]])
                 vel_end_pixel = ego_to_pixel(vel_end_pos)[0]
-                
+
                 # Draw velocity arrow
-                ax.arrow(agent_pixel[0], agent_pixel[1], 
-                        vel_end_pixel[0] - agent_pixel[0], 
+                ax_bev.arrow(agent_pixel[0], agent_pixel[1],
+                        vel_end_pixel[0] - agent_pixel[0],
                         vel_end_pixel[1] - agent_pixel[1],
-                        head_width=5, head_length=8, fc='cyan', ec='white', 
+                        head_width=5, head_length=8, fc='cyan', ec='white',
                         linewidth=1.5, alpha=0.8, length_includes_head=True)
             
             # Plot ego predicted trajectories
@@ -706,26 +697,23 @@ class DriveTransformerAgent(autonomous_agent.AutonomousAgent):
                 ego_fut_preds_fix_time_vis = np.dot(self.coor2topdown, ego_fut_preds_fix_time_vis.T).T
                 ego_fut_preds_fix_time_vis[:, :2] /= ego_fut_preds_fix_time_vis[:, 2:3]
                 ego_fut_preds_fix_time_vis = np.nan_to_num(ego_fut_preds_fix_time_vis)
-                # Red ego trajectory (fixed time) removed
-                
+                ax_bev.plot(ego_fut_preds_fix_time_vis[:, 0], 512 - ego_fut_preds_fix_time_vis[:, 1], 'o-', color='red',
+                       linewidth=2.5, markersize=4, alpha=0.9, label='Ego Traj (Fixed Time)')
+
                 # Process fix_dist trajectory (same as save() method)
-                ego_fut_preds_fix_dist_vis = ego_traj_fix_dist_raw[:, [1, 0]]
-                ego_fut_preds_fix_dist_vis = np.concatenate([ego_fut_preds_fix_dist_vis, np.zeros((ego_fut_preds_fix_dist_vis.shape[0], 1)), np.ones((ego_fut_preds_fix_dist_vis.shape[0], 1))], axis=-1)
-                ego_fut_preds_fix_dist_vis = np.dot(self.coor2topdown, ego_fut_preds_fix_dist_vis.T).T
-                ego_fut_preds_fix_dist_vis[:, :2] /= ego_fut_preds_fix_dist_vis[:, 2:3]
-                ego_fut_preds_fix_dist_vis = np.nan_to_num(ego_fut_preds_fix_dist_vis)
-                ax.plot(ego_fut_preds_fix_dist_vis[:, 0], 512 - ego_fut_preds_fix_dist_vis[:, 1], 's-', color='blue', 
-                       linewidth=2.5, markersize=4, alpha=0.9, label='Ego Traj (Fixed Dist)')
-            
-            ax.legend(loc='upper right', fontsize=10, facecolor='black', edgecolor='white', labelcolor='white')
-            
-            # Save figure with extra space to prevent clipping
-            if SAVE_PATH is not None:
-                fig_path = self.save_path / 'agent_predictions' 
-                fig_path.mkdir(exist_ok=True)
-                plt.savefig(fig_path / f'{self.step:04d}.png', dpi=150, bbox_inches='tight', 
-                           facecolor='black', pad_inches=0.5)
-            
+                # ego_fut_preds_fix_dist_vis = ego_traj_fix_dist_raw[:, [1, 0]]
+                # ego_fut_preds_fix_dist_vis = np.concatenate([ego_fut_preds_fix_dist_vis, np.zeros((ego_fut_preds_fix_dist_vis.shape[0], 1)), np.ones((ego_fut_preds_fix_dist_vis.shape[0], 1))], axis=-1)
+                # ego_fut_preds_fix_dist_vis = np.dot(self.coor2topdown, ego_fut_preds_fix_dist_vis.T).T
+                # ego_fut_preds_fix_dist_vis[:, :2] /= ego_fut_preds_fix_dist_vis[:, 2:3]
+                # ego_fut_preds_fix_dist_vis = np.nan_to_num(ego_fut_preds_fix_dist_vis)
+                # ax_bev.plot(ego_fut_preds_fix_dist_vis[:, 0], 512 - ego_fut_preds_fix_dist_vis[:, 1], 's-', color='blue',
+                #        linewidth=2.5, markersize=4, alpha=0.9, label='Ego Traj (Fixed Dist)')
+
+            ax_bev.legend(loc='upper right', fontsize=10, facecolor='black', edgecolor='white', labelcolor='white')
+
+            # Save combined visualization
+            plt.tight_layout()
+            plt.savefig(self.save_path / 'combined' / ('%04d.png' % self.step), dpi=100, bbox_inches='tight', facecolor='black')
             plt.close(fig)
 
         # breakpoint()
@@ -752,7 +740,7 @@ class DriveTransformerAgent(autonomous_agent.AutonomousAgent):
         self.pid_metadata['brake'] = control.brake
         self.pid_metadata['speed'] = float(tick_data['speed'])
         if SAVE_PATH is not None and self.step % 10 == 0:
-            self.save(tick_data, ego_traj_fix_time.copy(), ego_traj_fix_dist.copy(), draw_traj=True)
+            self.save(tick_data, ego_traj_fix_time.copy(), ego_traj_fix_dist.copy(), output_data_batch[0], draw_traj=True)
         self.prev_control = control
         if len(self.prev_control_cache)==2:
             self.prev_control_cache.pop(0)
@@ -783,32 +771,152 @@ class DriveTransformerAgent(autonomous_agent.AutonomousAgent):
         posemb = np.stack((np.sin(pos_tmp[..., 0::2]), np.cos(pos_tmp[..., 1::2])), axis=-1)
         return posemb.reshape(-1)
     
-    def save(self, tick_data, ego_fut_preds_fix_time, ego_fut_preds_fix_dist, draw_traj=False):
+    def save(self, tick_data, ego_fut_preds_fix_time, ego_fut_preds_fix_dist, agent_data, draw_traj=False):
         frame = self.step //10
-        Image.fromarray(tick_data['imgs']['CAM_FRONT']).save(self.save_path / 'rgb_front' / ('%04d.png' % frame))
-        # Image.fromarray(tick_data['imgs']['CAM_FRONT_LEFT']).save(self.save_path / 'rgb_front_left' / ('%04d.png' % frame))
-        # Image.fromarray(tick_data['imgs']['CAM_FRONT_RIGHT']).save(self.save_path / 'rgb_front_right' / ('%04d.png' % frame))
-        # Image.fromarray(tick_data['imgs']['CAM_BACK']).save(self.save_path / 'rgb_back' / ('%04d.png' % frame))
-        # Image.fromarray(tick_data['imgs']['CAM_BACK_LEFT']).save(self.save_path / 'rgb_back_left' / ('%04d.png' % frame))
-        # Image.fromarray(tick_data['imgs']['CAM_BACK_RIGHT']).save(self.save_path / 'rgb_back_right' / ('%04d.png' % frame))
-        
-        if draw_traj: # draw predict ego trajectories in bev image
-            ego_fut_preds_fix_time = ego_fut_preds_fix_time[:,[1,0]]
-            ego_fut_preds_fix_time = np.concatenate([ego_fut_preds_fix_time[:,], np.zeros((ego_fut_preds_fix_time.shape[0], 1)), np.ones((ego_fut_preds_fix_time.shape[0], 1))], axis=-1)
-            ego_fut_preds_fix_time = np.dot(self.coor2topdown, ego_fut_preds_fix_time.T).T
-            ego_fut_preds_fix_time[:, :2] /= ego_fut_preds_fix_time[:, 2:3]
-            ego_fut_preds_fix_time = np.nan_to_num(ego_fut_preds_fix_time)
-            for k in range(ego_fut_preds_fix_time.shape[0]):
-                cv2.circle(tick_data['bev'], (int(ego_fut_preds_fix_time[k, 0]), int(ego_fut_preds_fix_time[k, 1])), 0, (0, 0, 255), 5)
-            
-            ego_fut_preds_fix_dist = ego_fut_preds_fix_dist[:,[1,0]]
-            ego_fut_preds_fix_dist = np.concatenate([ego_fut_preds_fix_dist, np.zeros((ego_fut_preds_fix_dist.shape[0], 1)), np.ones((ego_fut_preds_fix_dist.shape[0], 1))], axis=-1)
-            ego_fut_preds_fix_dist = np.dot(self.coor2topdown, ego_fut_preds_fix_dist.T).T
-            ego_fut_preds_fix_dist[:, :2] /= ego_fut_preds_fix_dist[:, 2:3]
-            ego_fut_preds_fix_dist = np.nan_to_num(ego_fut_preds_fix_dist)
-            for k in range(ego_fut_preds_fix_dist.shape[0]):
-                cv2.circle(tick_data['bev'], (int(ego_fut_preds_fix_dist[k, 0]), int(ego_fut_preds_fix_dist[k, 1])), 0, (255, 0, 0), 5)
-        Image.fromarray(tick_data['bev']).save(self.save_path / 'bev' / ('%04d.png' % frame))
+
+        # Draw agent bounding boxes and trajectories on BEV
+        if 'boxes_3d' in agent_data and 'agent_traj_cls_scores' in agent_data:
+            agent_boxes = agent_data['boxes_3d'].tensor.cpu().numpy()
+            agent_scores = agent_data['scores_3d'].cpu().numpy()
+            agent_labels = agent_data['labels_3d'].cpu().numpy()
+            agent_trajs = agent_data['trajs_3d'].cpu().numpy()  # (N, 6, 12)
+            agent_traj_cls_scores = agent_data['agent_traj_cls_scores'].cpu().numpy()
+
+            # Handle both (N, 6) and (1, N, 6) shapes
+            if agent_traj_cls_scores.ndim == 3:
+                agent_traj_cls_scores = agent_traj_cls_scores[0]
+
+            best_modes = np.argmax(agent_traj_cls_scores, axis=1)
+
+            # Color map for different agent classes (BGR format for OpenCV)
+            class_colors_bgr = [
+                (0, 0, 255),      # red
+                (0, 165, 255),    # orange
+                (128, 0, 128),    # purple
+                (42, 42, 165),    # brown
+                (203, 192, 255),  # pink
+                (128, 128, 128),  # gray
+                (255, 255, 0),    # cyan
+                (0, 255, 255),    # yellow
+                (255, 0, 0),      # blue
+                (255, 0, 255)     # magenta
+            ]
+
+            # Draw each agent
+            for i in range(len(agent_boxes)):
+                if agent_scores[i] < 0.3:
+                    continue
+
+                x, y, z, w, l, h, yaw = agent_boxes[i, :7]
+                label_idx = int(agent_labels[i])
+                color_bgr = class_colors_bgr[label_idx % len(class_colors_bgr)]
+                best_mode = best_modes[i]
+
+                # Get agent trajectory for best mode (12, 2) - 12 timesteps, (x,y)
+                agent_traj = agent_trajs[i, best_mode, :]  # (12,) - alternating x,y
+                agent_traj_xy = agent_traj.reshape(-1, 2)  # (6, 2)
+
+                # Draw bounding box corners (same as matplotlib version)
+                corners_local = np.array([
+                    [l/2, w/2],    # front-left
+                    [l/2, -w/2],   # front-right
+                    [-l/2, -w/2],  # rear-right
+                    [-l/2, w/2],   # rear-left
+                    [l/2, w/2]     # close the box
+                ])
+
+                # Rotation matrix for yaw (add 90 degree offset, same as matplotlib)
+                yaw_corrected = yaw + np.pi/2
+                cos_yaw = np.cos(yaw_corrected)
+                sin_yaw = np.sin(yaw_corrected)
+                rot_matrix = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
+
+                # Rotate and translate corners to ego frame
+                corners_ego = (rot_matrix @ corners_local.T).T + np.array([x, y])
+
+                # Convert to BEV pixel coordinates (matching ego_to_pixel function exactly)
+                corners_swapped = corners_ego[:, [1, 0]]  # Swap x,y
+                corners_3d = np.concatenate([corners_swapped, np.zeros((len(corners_ego), 1)), np.ones((len(corners_ego), 1))], axis=-1)
+                corners_pixels = np.dot(self.coor2topdown, corners_3d.T).T
+                corners_pixels[:, :2] /= corners_pixels[:, 2:3]
+                # Flip Y coordinate so forward (positive X in ego) points up
+                corners_pixels[:, 1] = 512 - corners_pixels[:, 1]
+                # Swap X and Y for plotting (so X is forward/up, Y is left/right)
+                corners_pixels = corners_pixels[:, [1, 0]]
+                corners_pixels = np.nan_to_num(corners_pixels[:, :2]).astype(np.int32)
+
+                # Draw box
+                cv2.polylines(tick_data['bev'], [corners_pixels], False, color_bgr, 2)
+
+                # Draw velocity arrow (matching matplotlib version with ego_to_pixel)
+                vx, vy = agent_boxes[i, 7], agent_boxes[i, 8]  # Velocity in ego frame
+
+                # Convert agent center to pixels (using ego_to_pixel logic)
+                agent_center = np.array([[x, y]])
+                agent_center_swapped = agent_center[:, [1, 0]]
+                agent_center_3d = np.concatenate([agent_center_swapped, np.zeros((1, 1)), np.ones((1, 1))], axis=-1)
+                agent_center_pixel = np.dot(self.coor2topdown, agent_center_3d.T).T
+                agent_center_pixel[:, :2] /= agent_center_pixel[:, 2:3]
+                # Flip Y
+                agent_center_pixel[:, 1] = 512 - agent_center_pixel[:, 1]
+                # Swap X and Y
+                agent_center_pixel = agent_center_pixel[:, [1, 0]]
+                agent_center_pixel = np.nan_to_num(agent_center_pixel[:, :2]).astype(np.int32)[0]
+
+                # Scale velocity for visualization (1 m/s = 10 pixels in ego frame)
+                scale = 10.0
+                vel_end = np.array([[x + vx * scale, y + vy * scale]])
+                vel_end_swapped = vel_end[:, [1, 0]]
+                vel_end_3d = np.concatenate([vel_end_swapped, np.zeros((1, 1)), np.ones((1, 1))], axis=-1)
+                vel_end_pixel = np.dot(self.coor2topdown, vel_end_3d.T).T
+                vel_end_pixel[:, :2] /= vel_end_pixel[:, 2:3]
+                # Flip Y
+                vel_end_pixel[:, 1] = 512 - vel_end_pixel[:, 1]
+                # Swap X and Y
+                vel_end_pixel = vel_end_pixel[:, [1, 0]]
+                vel_end_pixel = np.nan_to_num(vel_end_pixel[:, :2]).astype(np.int32)[0]
+
+                # Draw velocity arrow (cyan fill with white edge, matching matplotlib)
+                # Create a copy to draw arrow with transparency effect
+                overlay = tick_data['bev'].copy()
+
+                # Draw arrow line in cyan
+                cv2.arrowedLine(overlay,
+                              tuple(agent_center_pixel),
+                              tuple(vel_end_pixel),
+                              (255, 255, 0),  # Cyan in BGR
+                              2, tipLength=0.25)
+
+                # Draw white outline for better visibility
+                cv2.arrowedLine(tick_data['bev'],
+                              tuple(agent_center_pixel),
+                              tuple(vel_end_pixel),
+                              (255, 255, 255),  # White in BGR
+                              3, tipLength=0.25)
+
+                # Blend the cyan arrow on top
+                cv2.arrowedLine(tick_data['bev'],
+                              tuple(agent_center_pixel),
+                              tuple(vel_end_pixel),
+                              (255, 255, 0),  # Cyan in BGR
+                              2, tipLength=0.25)
+
+        # Combined image is now saved via matplotlib in run_step (not here)
+        # front_img = tick_data['imgs']['CAM_FRONT']
+        # bev_img = tick_data['bev']
+        #
+        # # Get dimensions
+        # front_h, front_w = front_img.shape[:2]
+        # bev_h, bev_w = bev_img.shape[:2]
+        #
+        # # Resize BEV to match front camera height
+        # bev_resized = cv2.resize(bev_img, (int(bev_w * front_h / bev_h), front_h))
+        #
+        # # Concatenate horizontally (BEV on left, front on right)
+        # combined = np.concatenate([bev_resized, front_img], axis=1)
+        #
+        # # Save combined image only
+        # Image.fromarray(combined).save(self.save_path / 'combined' / ('%04d.png' % frame))
         outfile = open(self.save_path / 'meta' / ('%04d.json' % frame), 'w')
         json.dump(self.pid_metadata, outfile, indent=4)
         outfile.close()

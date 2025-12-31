@@ -368,7 +368,10 @@ class DiffusionHead(nn.Module):
                 nn.Linear(embed_dims, self.traj_flat_dim),
             ) for _ in range(num_contexts)
         ])
-        
+
+        # Load trajectory normalization statistics
+        self._load_normalization_stats()
+
         self._init_weights()
     
     def _init_weights(self):
@@ -378,7 +381,142 @@ class DiffusionHead(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-    
+
+    def _load_normalization_stats(self):
+        """Load trajectory normalization statistics from JSON file."""
+        import json
+        import os
+
+        stats_file = 'trajectory_normalization_stats.json'
+
+        if os.path.exists(stats_file):
+            with open(stats_file, 'r') as f:
+                norm_stats = json.load(f)
+
+            # Convert to tensors and register as buffers (not trainable parameters)
+            mean_x = torch.tensor(norm_stats['mean_x'], dtype=torch.float32)
+            std_x = torch.tensor(norm_stats['std_x'], dtype=torch.float32)
+            mean_y = torch.tensor(norm_stats['mean_y'], dtype=torch.float32)
+            std_y = torch.tensor(norm_stats['std_y'], dtype=torch.float32)
+
+            # Stack into (num_waypoints, 2) tensors
+            self.register_buffer('traj_norm_mean', torch.stack([mean_x, mean_y], dim=-1))
+            self.register_buffer('traj_norm_std', torch.stack([std_x, std_y], dim=-1))
+
+            print(f"✓ Loaded trajectory normalization stats from {stats_file}")
+            print(f"  Shape: {self.traj_norm_mean.shape}")
+        else:
+            # If stats file doesn't exist, use no normalization (mean=0, std=1)
+            print(f"⚠ Warning: {stats_file} not found. Using no normalization.")
+            self.register_buffer('traj_norm_mean', torch.zeros(self.num_traj_tokens, 2))
+            self.register_buffer('traj_norm_std', torch.ones(self.num_traj_tokens, 2))
+
+    def normalize_trajectory(self, ego_fut_gt):
+        """
+        Normalize trajectory to differential representation and apply per-timestep normalization.
+
+        Converts absolute waypoint coordinates to consecutive differences,
+        matching the normalization in get_trajectory_normalization_balues.py,
+        then normalizes using per-timestep mean and std.
+
+        Args:
+            ego_fut_gt: [B, N_future_time, 2] or [B, N_future_time * 2] absolute trajectory coordinates
+
+        Returns:
+            normalized_traj: [B, N_future_time, 2] normalized differential trajectory
+        """
+        device = ego_fut_gt.device
+        dtype = ego_fut_gt.dtype
+
+        # Check if already flattened [B, N_future_time * 2]
+        if ego_fut_gt.dim() == 2:
+            batch_size = ego_fut_gt.shape[0]
+            assert ego_fut_gt.shape[1] % 2 == 0, \
+                f"Flattened trajectory should have even dimension, got {ego_fut_gt.shape[1]}"
+            num_waypoints = ego_fut_gt.shape[1] // 2
+            ego_fut_gt = ego_fut_gt.view(batch_size, num_waypoints, 2)
+
+        batch_size = ego_fut_gt.shape[0]
+
+        # Input shape assertion
+        assert ego_fut_gt.dim() == 3, \
+            f"ego_fut_gt should be 3D [B, N_future_time, 2], got shape {ego_fut_gt.shape}"
+        assert ego_fut_gt.shape[2] == 2, \
+            f"ego_fut_gt should have 2 coords (x, y), got {ego_fut_gt.shape[2]}"
+
+        # Step 1: Convert to differential representation
+        # Add dummy (0,0) waypoint at the beginning to represent current position
+        dummy_waypoint = torch.zeros((batch_size, 1, 2), device=device, dtype=dtype)
+        ego_fut_gt_with_dummy = torch.cat([dummy_waypoint, ego_fut_gt], dim=1)  # [B, N_future_time+1, 2]
+
+        # Compute differential (consecutive differences)
+        ego_fut_gt_differential = ego_fut_gt_with_dummy[:, 1:] - ego_fut_gt_with_dummy[:, :-1]  # [B, N_future_time, 2]
+
+        assert ego_fut_gt_differential.shape == ego_fut_gt.shape, \
+            f"Differential shape mismatch: expected {ego_fut_gt.shape}, got {ego_fut_gt_differential.shape}"
+
+        # Step 2: Apply per-timestep normalization
+        # Ensure normalization stats are on the same device
+        norm_mean = self.traj_norm_mean.to(device)  # [N_future_time, 2]
+        norm_std = self.traj_norm_std.to(device)    # [N_future_time, 2]
+
+        # Normalize: (x - mean) / std
+        normalized_traj = (ego_fut_gt_differential - norm_mean) / norm_std
+
+        assert normalized_traj.shape == ego_fut_gt.shape, \
+            f"Normalized shape mismatch: expected {ego_fut_gt.shape}, got {normalized_traj.shape}"
+
+        return normalized_traj
+
+    def unnormalize_trajectory(self, normalized_traj_differential):
+        """
+        Unnormalize trajectory from differential representation back to absolute coordinates.
+
+        Reverses the normalization process: denormalizes the differential trajectory
+        and converts it back to absolute coordinates via cumulative sum.
+
+        Args:
+            normalized_traj_differential: [B, N_future_time, 2] or [B, N_future_time * 2] normalized differential trajectory
+
+        Returns:
+            ego_fut_absolute: [B, N_future_time, 2] absolute trajectory coordinates
+        """
+        # Check if already flattened [B, N_future_time * 2]
+        if normalized_traj_differential.dim() == 2:
+            batch_size = normalized_traj_differential.shape[0]
+            assert normalized_traj_differential.shape[1] % 2 == 0, \
+                f"Flattened trajectory should have even dimension, got {normalized_traj_differential.shape[1]}"
+            num_waypoints = normalized_traj_differential.shape[1] // 2
+            normalized_traj_differential = normalized_traj_differential.view(batch_size, num_waypoints, 2)
+
+        device = normalized_traj_differential.device
+
+        # Input shape assertion
+        assert normalized_traj_differential.dim() == 3, \
+            f"normalized_traj_differential should be 3D [B, N_future_time, 2], got shape {normalized_traj_differential.shape}"
+        assert normalized_traj_differential.shape[2] == 2, \
+            f"normalized_traj_differential should have 2 coords (x, y), got {normalized_traj_differential.shape[2]}"
+
+        # Step 1: Denormalize the differential trajectory
+        # Ensure normalization stats are on the same device
+        norm_mean = self.traj_norm_mean.to(device)  # [N_future_time, 2]
+        norm_std = self.traj_norm_std.to(device)    # [N_future_time, 2]
+
+        # Denormalize: x * std + mean
+        ego_fut_gt_differential = normalized_traj_differential * norm_std + norm_mean
+
+        assert ego_fut_gt_differential.shape == normalized_traj_differential.shape, \
+            f"Denormalized differential shape mismatch"
+
+        # Step 2: Convert differential to absolute via cumulative sum
+        # The differential represents consecutive differences from current position (0,0)
+        ego_fut_absolute = torch.cumsum(ego_fut_gt_differential, dim=1)
+
+        assert ego_fut_absolute.shape == normalized_traj_differential.shape, \
+            f"Absolute trajectory shape mismatch"
+
+        return ego_fut_absolute
+
     def get_timestep_embedding(self, timesteps, dim):
         """
         Create sinusoidal timestep embeddings.
@@ -1881,15 +2019,18 @@ class DriveTransformerlHead(BaseModule):
         
         # Use the ground truth trajectory as the clean target
         # ego_fut_gt shape: [B, N_future_time, 2]
-        # Flatten to [B, N_future_time * 2] for diffusion
+        # Convert to normalized differential representation before diffusion
         clean_traj = ego_fut_gt.to(device).float()  # [B, N_future_time, 2]
-        
-        # Handle shape: interpolate if needed, then flatten
+
+        # Handle shape: interpolate if needed
         if clean_traj.shape[1] != self.diffusion_num_traj_tokens:
             clean_traj = clean_traj.permute(0, 2, 1)  # [B, 2, N_future_time]
             clean_traj = F.interpolate(clean_traj, size=self.diffusion_num_traj_tokens, mode='linear', align_corners=True)
             clean_traj = clean_traj.permute(0, 2, 1)  # [B, N_traj_tokens, 2]
-        
+
+        # Normalize trajectory: convert to differential and apply per-timestep normalization
+        clean_traj = self.diffusion_head.normalize_trajectory(clean_traj)  # [B, N_traj_tokens, 2]
+
         # Flatten trajectory: [B, N_traj_tokens, 2] -> [B, N_traj_tokens * 2]
         clean_traj = clean_traj.flatten(-2)  # [B, N_traj_tokens * 2]
         

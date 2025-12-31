@@ -66,14 +66,16 @@ for ((i=0; i<$length; i++ )); do
     echo -e "\033[32m bash leaderboard/scripts/run_evaluation.sh $PORT $TM_PORT $IS_BENCH2DRIVE $ROUTES $TEAM_AGENT $TEAM_CONFIG $CHECKPOINT_ENDPOINT $SAVE_PATH $PLANNER_TYPE $GPU_RANK \033[0m"
     echo -e "***********************************************************************************"
     # ============================================================================
-    # MODIFICATION: Explicitly set DISPLAY= for each task
+    # MODIFICATION: Use restart wrapper to handle CARLA crashes
     # ============================================================================
-    DISPLAY= bash -e leaderboard/scripts/run_evaluation_original.sh $PORT $TM_PORT $IS_BENCH2DRIVE $ROUTES $TEAM_AGENT $TEAM_CONFIG $CHECKPOINT_ENDPOINT $SAVE_PATH $PLANNER_TYPE $GPU_RANK 2>&1 > ${BASE_ROUTES}_${TASK_LIST[$i]}_${ALGO}_${PLANNER_TYPE}.log &
+    # DISPLAY= bash -e leaderboard/scripts/run_evaluation_original.sh $PORT $TM_PORT $IS_BENCH2DRIVE $ROUTES $TEAM_AGENT $TEAM_CONFIG $CHECKPOINT_ENDPOINT $SAVE_PATH $PLANNER_TYPE $GPU_RANK 2>&1 > ${BASE_ROUTES}_${TASK_LIST[$i]}_${ALGO}_${PLANNER_TYPE}.log &
+    LOG_FILE_PATH="${BASE_ROUTES}_${TASK_LIST[$i]}_${ALGO}_${PLANNER_TYPE}.log"
+    nohup bash leaderboard/scripts/run_evaluation_with_restart.sh $PORT $TM_PORT $IS_BENCH2DRIVE $ROUTES $TEAM_AGENT $TEAM_CONFIG $CHECKPOINT_ENDPOINT $SAVE_PATH $PLANNER_TYPE $GPU_RANK "$LOG_FILE_PATH" > "$LOG_FILE_PATH" 2>&1 &
     # ============================================================================
     # END MODIFICATION
     # ============================================================================
     # source leaderboard/scripts/run_evaluation_original.sh $PORT $TM_PORT $IS_BENCH2DRIVE $ROUTES $TEAM_AGENT $TEAM_CONFIG $CHECKPOINT_ENDPOINT $SAVE_PATH $PLANNER_TYPE $GPU_RANK
 
-    sleep 20
+    sleep 35
 done
 wait
