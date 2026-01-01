@@ -1,0 +1,1 @@
+bash adzoo/drivetransformer/dist_train.sh adzoo/drivetransformer/configs/drivetransformer/drivetransformer_large_w_diffusion_head.py 4

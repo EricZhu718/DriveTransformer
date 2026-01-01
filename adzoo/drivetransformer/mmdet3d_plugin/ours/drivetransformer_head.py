@@ -27,7 +27,8 @@ from .utils import (
 )
 from mmcv.models.backbones.base_module import BaseModule
 from mmcv.core.bbox.structures.lidar_box3d import LiDARInstance3DBoxes
-
+import json
+import os
 
 class DiffusionScheduler(nn.Module):
     """
@@ -384,8 +385,7 @@ class DiffusionHead(nn.Module):
 
     def _load_normalization_stats(self):
         """Load trajectory normalization statistics from JSON file."""
-        import json
-        import os
+
 
         stats_file = 'trajectory_normalization_stats.json'
 
@@ -698,13 +698,14 @@ class DriveTransformerlHead(BaseModule):
         loss_plan_cls=None,
         ## Diffusion Loss
         use_diffusion_loss=False,
+        only_finetune_diffusion=False,
         diffusion_loss_weight=1.0,
         diffusion_num_timesteps=1000,
         diffusion_beta_start=0.0001,
         diffusion_beta_end=0.02,
         diffusion_schedule_type='linear',  # 'linear', 'cosine', or 'quadratic'
         diffusion_loss_type='mse',  # 'mse' or 'l1'
-        diffusion_num_traj_tokens=6,  # Number of trajectory tokens for denoiser
+        diffusion_num_traj_tokens=30,  # Number of trajectory tokens for denoiser
         diffusion_num_heads=8,
         diffusion_ffn_dim=1024,
         ## Cfg
@@ -885,6 +886,7 @@ class DriveTransformerlHead(BaseModule):
         self.loss_plan_cls = build_loss(loss_plan_cls)
         ## Diffusion Loss
         self.use_diffusion_loss = use_diffusion_loss
+        self.only_finetune_diffusion = only_finetune_diffusion,
         self.diffusion_loss_weight = diffusion_loss_weight
         self.diffusion_loss_type = diffusion_loss_type
         self.diffusion_num_traj_tokens = diffusion_num_traj_tokens
@@ -1004,6 +1006,9 @@ class DriveTransformerlHead(BaseModule):
 
         ## Major Layer
         self.transformer = build_transformer(transformer)
+        if self.only_finetune_diffusion:
+            for param in self.transformer.parameters():
+                param.requires_grad = False
         self.init_output_head()
         self.reset_memory()
         self.pseudo_map_instance = None
@@ -1248,48 +1253,97 @@ class DriveTransformerlHead(BaseModule):
         ego_prep_traj_ref_fix_time = self.ego_traj_branches_fix_time[-1](ego_query).view(bs, ego_query.shape[1], self.fut_ts_ego_fix_time, 2)         
         ego_prep_traj_ref_fix_dist = self.ego_traj_branches_fix_dist[-1](ego_query).view(bs, ego_query.shape[1], self.fut_ts_ego_fix_dist, 1) if self.fut_ego_fix_dist else None
         ego_prep_traj_cls = self.traj_cls_branches[-1](ego_query) if self.ego_multi_modal else None
-        # major transformer 
-        agent_query, map_query, ego_query, results = self.transformer(
-            agent_query, # [B, N_agent_query, D] ||| queries and position embeddings
-            map_query, # [B, N_map_query, D]
-            ego_query, # [B, N_ego_mode, D]
-            img_feats, # [B, N_image_token,D]
-            img_pos_embed, # [B, N_image_token,D]
-            agent_temp_memory, # [B, L_memory * N_memory_agent_per_frame, D] ||| memorized queries and position embeddings
-            agent_temp_pos, # [B, L_memory * N_memory_agent_per_frame, D]
-            map_temp_memory, # [B, L_memory * N_memory_map_per_frame, D]
-            map_temp_pos, # [B, L_memory * N_memory_map_per_frame, D]
-            self.ego_memory_embedding, # [B, L_memory, D] 
-            ego_temp_pos, # [B, L_memory,D]  ||| reference points
-            agent_prep_ref, # [B, N_agent_query, C_box]
-            map_prep_ref, # [B, N_map_query,2]
-            map_prep_pts_coord,  # [B,N_map_query, N_pts_per_line, 2]
-            ego_ref, #[B ,N_ego_mode,3]
-            agent_prep_traj_ref, # [B,N_agent_query, N_mode,N_future, 2]
-            ego_prep_traj_ref_fix_time, # [B,N_mode, N_future_ego_time, 2]
-            ego_prep_traj_ref_fix_dist, # [B,N_mode, N_future_ego_dist, 2]
-            mode_query=mode_query,  # [B, N_mode, D] 
-            agent_cls=agent_prep_class, # [B, N_agent_query, N_object_type]
-            map_cls=map_prep_class, # [B, N_map_query, N_map_type]
-            agent_ref_embedding=self.agent_ref_embedding, # network layers and heads
-            agent_cls_embedding=self.agent_cls_embedding,
-            map_ref_embedding=self.map_ref_embedding,
-            map_cls_embedding=self.map_cls_embedding,
-            ego_pos_embedding=self.agent_ref_embedding,
-            ego_traj_ref_fix_time_embedding=self.ego_traj_ref_fix_time_embedding,
-            ego_traj_ref_fix_dist_embedding=self.ego_traj_ref_fix_dist_embedding,
-            reg_branches=self.reg_branches,
-            cls_branches=self.cls_branches,
-            traj_branches=self.traj_branches,
-            traj_cls_branches=self.traj_cls_branches,
-            map_reg_branches=self.map_reg_branches,
-            map_cls_branches=self.map_cls_branches,
-            temp_attn_masks=self.memory_prev_exists,
-            ego_traj_branches_fix_dist=self.ego_traj_branches_fix_dist,
-            ego_traj_branches_fix_time=self.ego_traj_branches_fix_time,
-            ego_traj_cls_branches=self.ego_traj_cls_branches,
-            return_intermediate_queries=True,
-        )
+        # major transformer
+        if self.only_finetune_diffusion:
+            with torch.no_grad():
+                agent_query, map_query, ego_query, results = self.transformer(
+                    agent_query, # [B, N_agent_query, D] ||| queries and position embeddings
+                    map_query, # [B, N_map_query, D]
+                    ego_query, # [B, N_ego_mode, D]
+                    img_feats, # [B, N_image_token,D]
+                    img_pos_embed, # [B, N_image_token,D]
+                    agent_temp_memory, # [B, L_memory * N_memory_agent_per_frame, D] ||| memorized queries and position embeddings
+                    agent_temp_pos, # [B, L_memory * N_memory_agent_per_frame, D]
+                    map_temp_memory, # [B, L_memory * N_memory_map_per_frame, D]
+                    map_temp_pos, # [B, L_memory * N_memory_map_per_frame, D]
+                    self.ego_memory_embedding, # [B, L_memory, D]
+                    ego_temp_pos, # [B, L_memory,D]  ||| reference points
+                    agent_prep_ref, # [B, N_agent_query, C_box]
+                    map_prep_ref, # [B, N_map_query,2]
+                    map_prep_pts_coord,  # [B,N_map_query, N_pts_per_line, 2]
+                    ego_ref, #[B ,N_ego_mode,3]
+                    agent_prep_traj_ref, # [B,N_agent_query, N_mode,N_future, 2]
+                    ego_prep_traj_ref_fix_time, # [B,N_mode, N_future_ego_time, 2]
+                    ego_prep_traj_ref_fix_dist, # [B,N_mode, N_future_ego_dist, 2]
+                    mode_query=mode_query,  # [B, N_mode, D]
+                    agent_cls=agent_prep_class, # [B, N_agent_query, N_object_type]
+                    map_cls=map_prep_class, # [B, N_map_query, N_map_type]
+                    agent_ref_embedding=self.agent_ref_embedding, # network layers and heads
+                    agent_cls_embedding=self.agent_cls_embedding,
+                    map_ref_embedding=self.map_ref_embedding,
+                    map_cls_embedding=self.map_cls_embedding,
+                    ego_pos_embedding=self.agent_ref_embedding,
+                    ego_traj_ref_fix_time_embedding=self.ego_traj_ref_fix_time_embedding,
+                    ego_traj_ref_fix_dist_embedding=self.ego_traj_ref_fix_dist_embedding,
+                    reg_branches=self.reg_branches,
+                    cls_branches=self.cls_branches,
+                    traj_branches=self.traj_branches,
+                    traj_cls_branches=self.traj_cls_branches,
+                    map_reg_branches=self.map_reg_branches,
+                    map_cls_branches=self.map_cls_branches,
+                    temp_attn_masks=self.memory_prev_exists,
+                    ego_traj_branches_fix_dist=self.ego_traj_branches_fix_dist,
+                    ego_traj_branches_fix_time=self.ego_traj_branches_fix_time,
+                    ego_traj_cls_branches=self.ego_traj_cls_branches,
+                    return_intermediate_queries=True,
+                )
+            # Detach outputs to prevent gradients flowing back through frozen transformer
+            agent_query = agent_query.detach()
+            map_query = map_query.detach()
+            ego_query = ego_query.detach()
+            results = [[r.detach() if r is not None else None for r in layer_results] for layer_results in results]
+        else:
+            agent_query, map_query, ego_query, results = self.transformer(
+                agent_query, # [B, N_agent_query, D] ||| queries and position embeddings
+                map_query, # [B, N_map_query, D]
+                ego_query, # [B, N_ego_mode, D]
+                img_feats, # [B, N_image_token,D]
+                img_pos_embed, # [B, N_image_token,D]
+                agent_temp_memory, # [B, L_memory * N_memory_agent_per_frame, D] ||| memorized queries and position embeddings
+                agent_temp_pos, # [B, L_memory * N_memory_agent_per_frame, D]
+                map_temp_memory, # [B, L_memory * N_memory_map_per_frame, D]
+                map_temp_pos, # [B, L_memory * N_memory_map_per_frame, D]
+                self.ego_memory_embedding, # [B, L_memory, D]
+                ego_temp_pos, # [B, L_memory,D]  ||| reference points
+                agent_prep_ref, # [B, N_agent_query, C_box]
+                map_prep_ref, # [B, N_map_query,2]
+                map_prep_pts_coord,  # [B,N_map_query, N_pts_per_line, 2]
+                ego_ref, #[B ,N_ego_mode,3]
+                agent_prep_traj_ref, # [B,N_agent_query, N_mode,N_future, 2]
+                ego_prep_traj_ref_fix_time, # [B,N_mode, N_future_ego_time, 2]
+                ego_prep_traj_ref_fix_dist, # [B,N_mode, N_future_ego_dist, 2]
+                mode_query=mode_query,  # [B, N_mode, D]
+                agent_cls=agent_prep_class, # [B, N_agent_query, N_object_type]
+                map_cls=map_prep_class, # [B, N_map_query, N_map_type]
+                agent_ref_embedding=self.agent_ref_embedding, # network layers and heads
+                agent_cls_embedding=self.agent_cls_embedding,
+                map_ref_embedding=self.map_ref_embedding,
+                map_cls_embedding=self.map_cls_embedding,
+                ego_pos_embedding=self.agent_ref_embedding,
+                ego_traj_ref_fix_time_embedding=self.ego_traj_ref_fix_time_embedding,
+                ego_traj_ref_fix_dist_embedding=self.ego_traj_ref_fix_dist_embedding,
+                reg_branches=self.reg_branches,
+                cls_branches=self.cls_branches,
+                traj_branches=self.traj_branches,
+                traj_cls_branches=self.traj_cls_branches,
+                map_reg_branches=self.map_reg_branches,
+                map_cls_branches=self.map_cls_branches,
+                temp_attn_masks=self.memory_prev_exists,
+                ego_traj_branches_fix_dist=self.ego_traj_branches_fix_dist,
+                ego_traj_branches_fix_time=self.ego_traj_branches_fix_time,
+                ego_traj_cls_branches=self.ego_traj_cls_branches,
+                return_intermediate_queries=True,
+            )
         # collect results
         agent_traj_coords, agent_traj_cls, agent_coords_bev, agent_coords, agent_class, map_pts_coords, map_class, \
         ego_traj_fix_time, ego_traj_fix_dist, ego_traj_cls, intermediate_agent_query, intermediate_map_query, intermediate_ego_query = \
@@ -2023,13 +2077,29 @@ class DriveTransformerlHead(BaseModule):
         clean_traj = ego_fut_gt.to(device).float()  # [B, N_future_time, 2]
 
         # Handle shape: interpolate if needed
-        if clean_traj.shape[1] != self.diffusion_num_traj_tokens:
-            clean_traj = clean_traj.permute(0, 2, 1)  # [B, 2, N_future_time]
-            clean_traj = F.interpolate(clean_traj, size=self.diffusion_num_traj_tokens, mode='linear', align_corners=True)
-            clean_traj = clean_traj.permute(0, 2, 1)  # [B, N_traj_tokens, 2]
+        # if clean_traj.shape[1] != self.diffusion_num_traj_tokens:
+        assert clean_traj.shape[1] == self.diffusion_num_traj_tokens, \
+            f"clean_traj time dimension mismatch: expected {self.diffusion_num_traj_tokens}, got {clean_traj.shape[1]}"
+        # if clean_traj.shape[1] != self.diffusion_num_traj_tokens:
+        #     clean_traj = clean_traj.permute(0, 2, 1)  # [B, 2, N_future_time]
+        #     clean_traj = F.interpolate(clean_traj, size=self.diffusion_num_traj_tokens, mode='linear', align_corners=True)
+        #     clean_traj = clean_traj.permute(0, 2, 1)  # [B, N_traj_tokens, 2]
 
         # Normalize trajectory: convert to differential and apply per-timestep normalization
         clean_traj = self.diffusion_head.normalize_trajectory(clean_traj)  # [B, N_traj_tokens, 2]
+        
+        DEBUG = True
+        if DEBUG:
+            # record the clean traj for debugging
+            json_debug_path = 'debug_clean_traj_json.json'
+            if os.path.exists(json_debug_path):
+                with open(json_debug_path, 'r') as f:
+                    debug_data = json.load(f)
+            else:
+                debug_data = {}
+            debug_data[f'clean_traj_{len(debug_data)}'] = clean_traj[0].cpu().numpy().tolist()
+            with open(json_debug_path, 'w') as f:
+                json.dump(debug_data, f, indent=2)
 
         # Flatten trajectory: [B, N_traj_tokens, 2] -> [B, N_traj_tokens * 2]
         clean_traj = clean_traj.flatten(-2)  # [B, N_traj_tokens * 2]
@@ -2526,173 +2596,174 @@ class DriveTransformerlHead(BaseModule):
             f'{self.__class__.__name__} only supports ' \
             f'for gt_bboxes_ignore setting to None.'
 
-        map_gt_vecs_list = copy.deepcopy(map_gt_bboxes_list)
+        if not self.only_finetune_diffusion:
+            map_gt_vecs_list = copy.deepcopy(map_gt_bboxes_list)
 
-        all_cls_scores = preds_dicts['all_cls_scores']
-        all_bbox_preds = preds_dicts['all_bbox_preds']
-        all_traj_preds = preds_dicts['all_traj_preds']
-        all_traj_cls_scores = preds_dicts['all_traj_cls_scores']
-        map_all_cls_scores = preds_dicts['map_all_cls_scores']
-        map_all_bbox_preds = preds_dicts['map_all_bbox_preds']
-        map_all_pts_preds = preds_dicts['map_all_pts_preds']
-        ego_fut_preds_traj_fix_time = preds_dicts['ego_fut_preds_fix_time']
-        ego_fut_preds_traj_fix_dist = preds_dicts['ego_fut_preds_fix_dist'] if self.fut_ego_fix_dist else None
-        ego_fut_preds_cls = preds_dicts['ego_traj_cls_scores']
-        map_pre_cls_scores = preds_dicts['map_pre_cls_scores']
-        map_pre_coord_preds = preds_dicts['map_pre_coord_preds']
-        map_pre_pts_coord_preds = preds_dicts['map_pre_pts_coord_preds']
-        agent_pre_cls_scores = preds_dicts['agent_pre_cls_scores']
-        agent_pre_coord_preds = preds_dicts['agent_pre_coord_preds']
+            all_cls_scores = preds_dicts['all_cls_scores']
+            all_bbox_preds = preds_dicts['all_bbox_preds']
+            all_traj_preds = preds_dicts['all_traj_preds']
+            all_traj_cls_scores = preds_dicts['all_traj_cls_scores']
+            map_all_cls_scores = preds_dicts['map_all_cls_scores']
+            map_all_bbox_preds = preds_dicts['map_all_bbox_preds']
+            map_all_pts_preds = preds_dicts['map_all_pts_preds']
+            ego_fut_preds_traj_fix_time = preds_dicts['ego_fut_preds_fix_time']
+            ego_fut_preds_traj_fix_dist = preds_dicts['ego_fut_preds_fix_dist'] if self.fut_ego_fix_dist else None
+            ego_fut_preds_cls = preds_dicts['ego_traj_cls_scores']
+            map_pre_cls_scores = preds_dicts['map_pre_cls_scores']
+            map_pre_coord_preds = preds_dicts['map_pre_coord_preds']
+            map_pre_pts_coord_preds = preds_dicts['map_pre_pts_coord_preds']
+            agent_pre_cls_scores = preds_dicts['agent_pre_cls_scores']
+            agent_pre_coord_preds = preds_dicts['agent_pre_coord_preds']
 
 
-        num_dec_layers = len(all_cls_scores)
-        device = gt_labels_list[0].device
+            num_dec_layers = len(all_cls_scores)
+            device = gt_labels_list[0].device
 
-        if self.pseudo_agent_instance is None:
-            self.pseudo_agent_instance = [LiDARInstance3DBoxes(torch.Tensor([[0.0, 0.0, 0.0, 3.0, 1.5, 1.5, 0.0, 0.0, 0.0]]), box_dim=9), torch.zeros(1).long().cuda(), torch.zeros(1, 34).cuda()]
-        
-        new_gt_bboxes_list = []
-        gt_bboxes_mask = torch.ones(len(gt_labels_list), device=device)
-        for i, gt_labels in enumerate(gt_labels_list):
-            # if there is no gt, mask the corresponding loss, and use the pseudo agent instance
-            if len(gt_labels) == 0:
-                gt_bboxes_mask[i] = 0
-                new_gt_bboxes_list.append(torch.cat(
-                    (self.pseudo_agent_instance[0].gravity_center, self.pseudo_agent_instance[0].tensor[:, 3:]),
-                    dim=1).to(device))
-                gt_labels_list[i] = self.pseudo_agent_instance[1].to(device)
-                # no need to adjust gt_traj_fut_classes, cuz it's already padded
-                gt_attr_labels[i] = self.pseudo_agent_instance[2].to(device)
-            else :
-                new_gt_bboxes_list.append(torch.cat(
-                    (gt_bboxes_list[i].gravity_center, gt_bboxes_list[i].tensor[:, 3:]), # (x, y, z, x_size, y_size, z_size, yaw, vx, vy)
-                    dim=1).to(device))
-        all_gt_bboxes_list = [new_gt_bboxes_list for _ in range(num_dec_layers)]
-        all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]
-        all_gt_traj_fut_classes = [gt_traj_fut_classes for _ in range(num_dec_layers)]
-        all_gt_attr_labels_list = [gt_attr_labels for _ in range(num_dec_layers)]
-        all_gt_bboxes_ignore_list = [
-            gt_bboxes_ignore for _ in range(num_dec_layers)
-        ]
-        all_gt_bboxes_mask = [gt_bboxes_mask for _ in range(num_dec_layers)]
-        
-        losses_cls, losses_bbox, losses_traj, losses_traj_cls = multi_apply(
-            self.loss_single, all_cls_scores, all_bbox_preds, all_traj_preds,
-            all_traj_cls_scores, all_gt_bboxes_list, all_gt_labels_list,
-            all_gt_attr_labels_list, all_gt_traj_fut_classes, all_gt_bboxes_mask, all_gt_bboxes_ignore_list)
-        
-        l0_agent_loss_cls_all, l0_aggent_loss_bbox_all = self.loss_single_box_only(agent_pre_cls_scores, agent_pre_coord_preds, all_gt_bboxes_list[0], all_gt_labels_list[0], all_gt_bboxes_mask[0])
-
-        num_dec_layers = len(map_all_cls_scores)
-        device = map_gt_labels_list[0].device
-
-        # randomly grab a pseudo map_bbox_instance
-        if self.pseudo_map_instance is None:
-            for i in range(len(map_gt_labels_list)):
-                if len(map_gt_labels_list[i]) != 0:
-                    self.pseudo_map_instance = [map_gt_vecs_list[i], map_gt_labels_list[i]]
-                    break
-            assert self.pseudo_map_instance is not None
-        new_map_gt_bboxes_list = []
-        map_gt_pts_list = []
-        map_gt_shifts_pts_list = []
-        map_loss_gt_mask = torch.ones(len(map_gt_vecs_list), device=device)
-        for i, map_gt_labels in enumerate(map_gt_labels_list):
-            # if there is no gt, mask the corresponding loss, and use the pseudo map instance
-            if len(map_gt_labels) == 0:
-                map_loss_gt_mask[i] = 0
-                new_map_gt_bboxes_list.append(self.pseudo_map_instance[0].bbox.to(device))
-                map_gt_pts_list.append(self.pseudo_map_instance[0].fixed_num_sampled_points.to(device))
-                map_gt_shifts_pts_list.append(self.pseudo_map_instance[0].shift_fixed_num_sampled_points.to(device))
-                map_gt_labels_list[i] = self.pseudo_map_instance[1].to(device)
-            else :
-                new_map_gt_bboxes_list.append(map_gt_bboxes_list[i].bbox.to(device))
-                map_gt_pts_list.append(map_gt_bboxes_list[i].fixed_num_sampled_points.to(device))
-                if self.map_gt_shift_pts_pattern == 'v0':
-                    map_gt_shifts_pts_list.append(map_gt_bboxes_list[i].shift_fixed_num_sampled_points.to(device))
-                elif self.map_gt_shift_pts_pattern == 'v1':
-                    map_gt_shifts_pts_list.append(map_gt_bboxes_list[i].shift_fixed_num_sampled_points_v1.to(device))
-                elif self.map_gt_shift_pts_pattern == 'v2':
-                    map_gt_shifts_pts_list.append(map_gt_bboxes_list[i].shift_fixed_num_sampled_points_v2.to(device))
-                elif self.map_gt_shift_pts_pattern == 'v3':
-                    map_gt_shifts_pts_list.append(map_gt_bboxes_list[i].shift_fixed_num_sampled_points_v3.to(device))
-                elif self.map_gt_shift_pts_pattern == 'v4':
-                    map_gt_shifts_pts_list.append(map_gt_bboxes_list[i].shift_fixed_num_sampled_points_v4.to(device))
-                else:
-                    raise NotImplementedError
-
-        map_all_gt_bboxes_list = [new_map_gt_bboxes_list for _ in range(num_dec_layers)]
-        map_all_gt_labels_list = [map_gt_labels_list for _ in range(num_dec_layers)]
-        map_all_gt_pts_list = [map_gt_pts_list for _ in range(num_dec_layers)]
-        map_all_gt_shifts_pts_list = [map_gt_shifts_pts_list for _ in range(num_dec_layers)]
-        map_all_gt_bboxes_ignore_list = [
-            map_gt_bboxes_ignore for _ in range(num_dec_layers)
-        ]
-        map_all_loss_gt_mask = [map_loss_gt_mask for _ in range(num_dec_layers)]
-        map_losses_cls, map_losses_pts, map_losses_dir = multi_apply(
-            self.map_loss_single, map_all_cls_scores, map_all_bbox_preds,
-            map_all_pts_preds, map_all_gt_bboxes_list, map_all_gt_labels_list,
-            map_all_gt_shifts_pts_list, map_all_loss_gt_mask, map_all_gt_bboxes_ignore_list)
+            if self.pseudo_agent_instance is None:
+                self.pseudo_agent_instance = [LiDARInstance3DBoxes(torch.Tensor([[0.0, 0.0, 0.0, 3.0, 1.5, 1.5, 0.0, 0.0, 0.0]]), box_dim=9), torch.zeros(1).long().cuda(), torch.zeros(1, 34).cuda()]
             
-        l0_loss_map_cls_all, l0_loss_map_pts_all, l0_loss_map_dir_all = self.map_loss_single(map_pre_cls_scores, map_pre_coord_preds, map_pre_pts_coord_preds, map_all_gt_bboxes_list[0], map_all_gt_labels_list[0],map_all_gt_shifts_pts_list[0], map_all_loss_gt_mask[0], map_all_gt_bboxes_ignore_list[0])
-        
-        loss_dict = dict()
-        # loss from the last decoder layer
-        loss_dict['loss_cls'] = losses_cls[-1]
-        loss_dict['loss_bbox'] = losses_bbox[-1]
-        loss_dict['loss_traj'] = losses_traj[-1]
-        loss_dict['loss_traj_cls'] = losses_traj_cls[-1]
-        loss_dict['loss_map_cls'] = map_losses_cls[-1]
-        loss_dict['loss_map_pts'] = map_losses_pts[-1]
-        loss_dict['loss_map_dir'] = map_losses_dir[-1]
+            new_gt_bboxes_list = []
+            gt_bboxes_mask = torch.ones(len(gt_labels_list), device=device)
+            for i, gt_labels in enumerate(gt_labels_list):
+                # if there is no gt, mask the corresponding loss, and use the pseudo agent instance
+                if len(gt_labels) == 0:
+                    gt_bboxes_mask[i] = 0
+                    new_gt_bboxes_list.append(torch.cat(
+                        (self.pseudo_agent_instance[0].gravity_center, self.pseudo_agent_instance[0].tensor[:, 3:]),
+                        dim=1).to(device))
+                    gt_labels_list[i] = self.pseudo_agent_instance[1].to(device)
+                    # no need to adjust gt_traj_fut_classes, cuz it's already padded
+                    gt_attr_labels[i] = self.pseudo_agent_instance[2].to(device)
+                else :
+                    new_gt_bboxes_list.append(torch.cat(
+                        (gt_bboxes_list[i].gravity_center, gt_bboxes_list[i].tensor[:, 3:]), # (x, y, z, x_size, y_size, z_size, yaw, vx, vy)
+                        dim=1).to(device))
+            all_gt_bboxes_list = [new_gt_bboxes_list for _ in range(num_dec_layers)]
+            all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]
+            all_gt_traj_fut_classes = [gt_traj_fut_classes for _ in range(num_dec_layers)]
+            all_gt_attr_labels_list = [gt_attr_labels for _ in range(num_dec_layers)]
+            all_gt_bboxes_ignore_list = [
+                gt_bboxes_ignore for _ in range(num_dec_layers)
+            ]
+            all_gt_bboxes_mask = [gt_bboxes_mask for _ in range(num_dec_layers)]
+            
+            losses_cls, losses_bbox, losses_traj, losses_traj_cls = multi_apply(
+                self.loss_single, all_cls_scores, all_bbox_preds, all_traj_preds,
+                all_traj_cls_scores, all_gt_bboxes_list, all_gt_labels_list,
+                all_gt_attr_labels_list, all_gt_traj_fut_classes, all_gt_bboxes_mask, all_gt_bboxes_ignore_list)
+            
+            l0_agent_loss_cls_all, l0_aggent_loss_bbox_all = self.loss_single_box_only(agent_pre_cls_scores, agent_pre_coord_preds, all_gt_bboxes_list[0], all_gt_labels_list[0], all_gt_bboxes_mask[0])
 
-        # Planning Loss
-        ego_fut_gt_fix_time = ego_fut_gt_fix_time.squeeze(1)
-        ego_fut_masks_fix_time = ego_fut_masks_fix_time.squeeze(1).squeeze(1)
-        ego_fut_gt_fix_dist = ego_fut_gt_fix_dist.squeeze(1) if ego_fut_gt_fix_dist is not None else None
-        ego_fut_masks_fix_dist = ego_fut_masks_fix_dist.squeeze(1).squeeze(1) if ego_fut_masks_fix_dist is not None else None
+            num_dec_layers = len(map_all_cls_scores)
+            device = map_gt_labels_list[0].device
 
-        batch, num_agent = all_traj_preds[-1].shape[:2]
-        loss_plan_input = [ego_fut_preds_traj_fix_time, ego_fut_preds_traj_fix_dist, ego_fut_preds_cls, ego_fut_gt_fix_time, ego_fut_masks_fix_time, 
-                           ego_fut_gt_fix_dist, ego_fut_masks_fix_dist, ego_fut_classes]
+            # randomly grab a pseudo map_bbox_instance
+            if self.pseudo_map_instance is None:
+                for i in range(len(map_gt_labels_list)):
+                    if len(map_gt_labels_list[i]) != 0:
+                        self.pseudo_map_instance = [map_gt_vecs_list[i], map_gt_labels_list[i]]
+                        break
+                assert self.pseudo_map_instance is not None
+            new_map_gt_bboxes_list = []
+            map_gt_pts_list = []
+            map_gt_shifts_pts_list = []
+            map_loss_gt_mask = torch.ones(len(map_gt_vecs_list), device=device)
+            for i, map_gt_labels in enumerate(map_gt_labels_list):
+                # if there is no gt, mask the corresponding loss, and use the pseudo map instance
+                if len(map_gt_labels) == 0:
+                    map_loss_gt_mask[i] = 0
+                    new_map_gt_bboxes_list.append(self.pseudo_map_instance[0].bbox.to(device))
+                    map_gt_pts_list.append(self.pseudo_map_instance[0].fixed_num_sampled_points.to(device))
+                    map_gt_shifts_pts_list.append(self.pseudo_map_instance[0].shift_fixed_num_sampled_points.to(device))
+                    map_gt_labels_list[i] = self.pseudo_map_instance[1].to(device)
+                else :
+                    new_map_gt_bboxes_list.append(map_gt_bboxes_list[i].bbox.to(device))
+                    map_gt_pts_list.append(map_gt_bboxes_list[i].fixed_num_sampled_points.to(device))
+                    if self.map_gt_shift_pts_pattern == 'v0':
+                        map_gt_shifts_pts_list.append(map_gt_bboxes_list[i].shift_fixed_num_sampled_points.to(device))
+                    elif self.map_gt_shift_pts_pattern == 'v1':
+                        map_gt_shifts_pts_list.append(map_gt_bboxes_list[i].shift_fixed_num_sampled_points_v1.to(device))
+                    elif self.map_gt_shift_pts_pattern == 'v2':
+                        map_gt_shifts_pts_list.append(map_gt_bboxes_list[i].shift_fixed_num_sampled_points_v2.to(device))
+                    elif self.map_gt_shift_pts_pattern == 'v3':
+                        map_gt_shifts_pts_list.append(map_gt_bboxes_list[i].shift_fixed_num_sampled_points_v3.to(device))
+                    elif self.map_gt_shift_pts_pattern == 'v4':
+                        map_gt_shifts_pts_list.append(map_gt_bboxes_list[i].shift_fixed_num_sampled_points_v4.to(device))
+                    else:
+                        raise NotImplementedError
 
-        loss_plan_reg_fix_time, loss_plan_reg_fix_dist, loss_plan_cls = self.loss_planning(*loss_plan_input)
-        for i in range(len(loss_plan_reg_fix_time)):
-            loss_dict[f"d{i}.loss_plan_l1_fix_time"] = loss_plan_reg_fix_time[i] 
-            if loss_plan_reg_fix_dist is not None:
-                loss_dict[f"d{i}.loss_plan_l1_fix_dist"] = loss_plan_reg_fix_dist[i] 
-            if self.ego_multi_modal:
-                loss_dict[f"d{i}.loss_plan_cls"] = loss_plan_cls[i] 
+            map_all_gt_bboxes_list = [new_map_gt_bboxes_list for _ in range(num_dec_layers)]
+            map_all_gt_labels_list = [map_gt_labels_list for _ in range(num_dec_layers)]
+            map_all_gt_pts_list = [map_gt_pts_list for _ in range(num_dec_layers)]
+            map_all_gt_shifts_pts_list = [map_gt_shifts_pts_list for _ in range(num_dec_layers)]
+            map_all_gt_bboxes_ignore_list = [
+                map_gt_bboxes_ignore for _ in range(num_dec_layers)
+            ]
+            map_all_loss_gt_mask = [map_loss_gt_mask for _ in range(num_dec_layers)]
+            map_losses_cls, map_losses_pts, map_losses_dir = multi_apply(
+                self.map_loss_single, map_all_cls_scores, map_all_bbox_preds,
+                map_all_pts_preds, map_all_gt_bboxes_list, map_all_gt_labels_list,
+                map_all_gt_shifts_pts_list, map_all_loss_gt_mask, map_all_gt_bboxes_ignore_list)
+                
+            l0_loss_map_cls_all, l0_loss_map_pts_all, l0_loss_map_dir_all = self.map_loss_single(map_pre_cls_scores, map_pre_coord_preds, map_pre_pts_coord_preds, map_all_gt_bboxes_list[0], map_all_gt_labels_list[0],map_all_gt_shifts_pts_list[0], map_all_loss_gt_mask[0], map_all_gt_bboxes_ignore_list[0])
+            
+            loss_dict = dict()
+            # loss from the last decoder layer
+            loss_dict['loss_cls'] = losses_cls[-1]
+            loss_dict['loss_bbox'] = losses_bbox[-1]
+            loss_dict['loss_traj'] = losses_traj[-1]
+            loss_dict['loss_traj_cls'] = losses_traj_cls[-1]
+            loss_dict['loss_map_cls'] = map_losses_cls[-1]
+            loss_dict['loss_map_pts'] = map_losses_pts[-1]
+            loss_dict['loss_map_dir'] = map_losses_dir[-1]
 
-        loss_dict['d0.loss_cls_all'] = l0_agent_loss_cls_all
-        loss_dict['d0.loss_bbox_all'] = l0_aggent_loss_bbox_all
+            # Planning Loss
+            ego_fut_gt_fix_time = ego_fut_gt_fix_time.squeeze(1)
+            ego_fut_masks_fix_time = ego_fut_masks_fix_time.squeeze(1).squeeze(1)
+            ego_fut_gt_fix_dist = ego_fut_gt_fix_dist.squeeze(1) if ego_fut_gt_fix_dist is not None else None
+            ego_fut_masks_fix_dist = ego_fut_masks_fix_dist.squeeze(1).squeeze(1) if ego_fut_masks_fix_dist is not None else None
 
-        num_dec_layer = 0
-        for loss_cls_i, loss_bbox_i in zip(losses_cls[:-1], losses_bbox[:-1]):
-            loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
-            loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
-            num_dec_layer += 1
+            batch, num_agent = all_traj_preds[-1].shape[:2]
+            loss_plan_input = [ego_fut_preds_traj_fix_time, ego_fut_preds_traj_fix_dist, ego_fut_preds_cls, ego_fut_gt_fix_time, ego_fut_masks_fix_time, 
+                            ego_fut_gt_fix_dist, ego_fut_masks_fix_dist, ego_fut_classes]
 
-        num_dec_layer = 0
-        for loss_traj_cls_i, loss_traj_i in zip(losses_traj_cls[:-1], losses_traj[:-1]):
-            loss_dict[f'd{num_dec_layer}.loss_traj_cls'] = loss_traj_cls_i
-            loss_dict[f'd{num_dec_layer}.loss_traj'] = loss_traj_i
-            num_dec_layer += 1
+            loss_plan_reg_fix_time, loss_plan_reg_fix_dist, loss_plan_cls = self.loss_planning(*loss_plan_input)
+            for i in range(len(loss_plan_reg_fix_time)):
+                loss_dict[f"d{i}.loss_plan_l1_fix_time"] = loss_plan_reg_fix_time[i] 
+                if loss_plan_reg_fix_dist is not None:
+                    loss_dict[f"d{i}.loss_plan_l1_fix_dist"] = loss_plan_reg_fix_dist[i] 
+                if self.ego_multi_modal:
+                    loss_dict[f"d{i}.loss_plan_cls"] = loss_plan_cls[i] 
 
-        loss_dict['d0.loss_map_cls_all'] = l0_loss_map_cls_all
-        loss_dict['d0.loss_map_pts_all'] = l0_loss_map_pts_all
-        loss_dict['d0.loss_map_dir_all'] = l0_loss_map_dir_all
+            loss_dict['d0.loss_cls_all'] = l0_agent_loss_cls_all
+            loss_dict['d0.loss_bbox_all'] = l0_aggent_loss_bbox_all
 
-        num_dec_layer = 0
-        for map_loss_cls_i, map_loss_pts_i, map_loss_dir_i in zip(
-            map_losses_cls[:-1],
-            map_losses_pts[:-1],
-            map_losses_dir[:-1]
-        ):
-            loss_dict[f'd{num_dec_layer}.loss_map_cls'] = map_loss_cls_i
-            loss_dict[f'd{num_dec_layer}.loss_map_pts'] = map_loss_pts_i
-            loss_dict[f'd{num_dec_layer}.loss_map_dir'] = map_loss_dir_i
-            num_dec_layer += 1
+            num_dec_layer = 0
+            for loss_cls_i, loss_bbox_i in zip(losses_cls[:-1], losses_bbox[:-1]):
+                loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
+                loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
+                num_dec_layer += 1
+
+            num_dec_layer = 0
+            for loss_traj_cls_i, loss_traj_i in zip(losses_traj_cls[:-1], losses_traj[:-1]):
+                loss_dict[f'd{num_dec_layer}.loss_traj_cls'] = loss_traj_cls_i
+                loss_dict[f'd{num_dec_layer}.loss_traj'] = loss_traj_i
+                num_dec_layer += 1
+
+            loss_dict['d0.loss_map_cls_all'] = l0_loss_map_cls_all
+            loss_dict['d0.loss_map_pts_all'] = l0_loss_map_pts_all
+            loss_dict['d0.loss_map_dir_all'] = l0_loss_map_dir_all
+
+            num_dec_layer = 0
+            for map_loss_cls_i, map_loss_pts_i, map_loss_dir_i in zip(
+                map_losses_cls[:-1],
+                map_losses_pts[:-1],
+                map_losses_dir[:-1]
+            ):
+                loss_dict[f'd{num_dec_layer}.loss_map_cls'] = map_loss_cls_i
+                loss_dict[f'd{num_dec_layer}.loss_map_pts'] = map_loss_pts_i
+                loss_dict[f'd{num_dec_layer}.loss_map_dir'] = map_loss_dir_i
+                num_dec_layer += 1
         
         # Diffusion Loss on intermediate queries
         if self.use_diffusion_loss:
@@ -2706,6 +2777,7 @@ class DriveTransformerlHead(BaseModule):
                 ego_fut_gt=ego_fut_gt_fix_time,  # [B, N_future_time, 2]
                 ego_fut_mask=ego_fut_masks_fix_time  # [B, N_future_time]
             )
+            loss_dict = dict()
             if loss_diffusion is not None:
                 loss_dict['loss_diffusion'] = loss_diffusion
         
