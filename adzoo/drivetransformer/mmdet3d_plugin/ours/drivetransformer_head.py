@@ -299,7 +299,7 @@ class DiffusionHead(nn.Module):
     """
     def __init__(self, 
                  embed_dims=256,
-                 num_heads=8,
+                 num_heads=2,
                  num_traj_tokens=6,  # number of trajectory timesteps
                  num_timesteps=1000,  # total diffusion timesteps for normalization
                  dropout=0.1,
@@ -706,8 +706,8 @@ class DriveTransformerlHead(BaseModule):
         diffusion_schedule_type='linear',  # 'linear', 'cosine', or 'quadratic'
         diffusion_loss_type='mse',  # 'mse' or 'l1'
         diffusion_num_traj_tokens=30,  # Number of trajectory tokens for denoiser
-        diffusion_num_heads=8,
-        diffusion_ffn_dim=1024,
+        diffusion_num_heads=2,
+        diffusion_ffn_dim=256,
         ## Cfg
         train_cfg=None,
         test_cfg=None,
@@ -1006,9 +1006,7 @@ class DriveTransformerlHead(BaseModule):
 
         ## Major Layer
         self.transformer = build_transformer(transformer)
-        if self.only_finetune_diffusion:
-            for param in self.transformer.parameters():
-                param.requires_grad = False
+
         self.init_output_head()
         self.reset_memory()
         self.pseudo_map_instance = None
@@ -1122,7 +1120,62 @@ class DriveTransformerlHead(BaseModule):
                 ffn_dim=self.diffusion_ffn_dim,
                 num_contexts=num_mixed_up_layers + 1  # +1 for initial token state
             )
-    
+
+        # Freeze all components except diffusion head when only finetuning diffusion
+        if self.only_finetune_diffusion:
+            # Freeze transformer
+            for param in self.transformer.parameters():
+                param.requires_grad = False
+            # Freeze pre-decoders
+            for param in self.agent_prep_decoder.parameters():
+                param.requires_grad = False
+            for param in self.map_prep_decoder.parameters():
+                param.requires_grad = False
+            # Freeze all prediction heads (detection, mapping, planning)
+            for param in self.cls_branches.parameters():
+                param.requires_grad = False
+            for param in self.reg_branches.parameters():
+                param.requires_grad = False
+            for param in self.traj_branches.parameters():
+                param.requires_grad = False
+            if hasattr(self, 'traj_cls_branches'):
+                for param in self.traj_cls_branches.parameters():
+                    param.requires_grad = False
+            for param in self.map_cls_branches.parameters():
+                param.requires_grad = False
+            for param in self.map_reg_branches.parameters():
+                param.requires_grad = False
+            for param in self.ego_traj_branches_fix_time.parameters():
+                param.requires_grad = False
+            if hasattr(self, 'ego_traj_branches_fix_dist') and self.ego_traj_branches_fix_dist is not None:
+                for param in self.ego_traj_branches_fix_dist.parameters():
+                    param.requires_grad = False
+            if hasattr(self, 'ego_traj_cls_branches') and self.ego_traj_cls_branches is not None:
+                for param in self.ego_traj_cls_branches.parameters():
+                    param.requires_grad = False
+            # Freeze embeddings
+            for param in self.agent_ref_embedding.parameters():
+                param.requires_grad = False
+            for param in self.agent_cls_embedding.parameters():
+                param.requires_grad = False
+            for param in self.map_ref_embedding.parameters():
+                param.requires_grad = False
+            for param in self.map_cls_embedding.parameters():
+                param.requires_grad = False
+            for param in self.ego_traj_ref_fix_time_embedding.parameters():
+                param.requires_grad = False
+            if hasattr(self, 'ego_traj_ref_fix_dist_embedding') and self.ego_traj_ref_fix_dist_embedding is not None:
+                for param in self.ego_traj_ref_fix_dist_embedding.parameters():
+                    param.requires_grad = False
+            # Freeze planning encoders and mode embeddings
+            for param in self.ego_lcf_encoder.parameters():
+                param.requires_grad = False
+            for param in self.mode_embedding.parameters():
+                param.requires_grad = False
+            if hasattr(self, 'mode_mlp') and self.mode_mlp is not None:
+                for param in self.mode_mlp.parameters():
+                    param.requires_grad = False
+
     def xavier_uniform_linear(self, m):
         is_linear_layer = any([isinstance(m, nn.Linear), isinstance(m, nn.Conv2d), isinstance(m, nn.ConvTranspose2d)])
         if is_linear_layer:
@@ -1179,7 +1232,21 @@ class DriveTransformerlHead(BaseModule):
                 ego_his_trajs=None,
                 **data,
             ):
-        
+
+        # Detach all inputs if only finetuning diffusion (to prevent gradients to frozen components)
+        if self.only_finetune_diffusion:
+            img_feats = img_feats.detach()
+            if ego_lcf_feat is not None and isinstance(ego_lcf_feat, torch.Tensor):
+                ego_lcf_feat = ego_lcf_feat.detach()
+            if ego_fut_cmd is not None and isinstance(ego_fut_cmd, torch.Tensor):
+                ego_fut_cmd = ego_fut_cmd.detach()
+            if ego_his_trajs is not None and isinstance(ego_his_trajs, torch.Tensor):
+                ego_his_trajs = ego_his_trajs.detach()
+            # Detach tensors in data dict
+            for key in data:
+                if isinstance(data[key], torch.Tensor):
+                    data[key] = data[key].detach()
+
         # update the memory for current frame
         self.pre_update_memory(data)
         ## Img
@@ -1203,56 +1270,129 @@ class DriveTransformerlHead(BaseModule):
         agent_query, map_query, \
             agent_temp_memory, map_temp_memory, \
                 agent_temp_pos, map_temp_pos, ego_temp_pos, rec_ego_pose = self.temporal_alignment(agent_query, map_query)
-        ## Init PE
-        agent_pe = self.agent_ref_embedding(pos2posemb(agent_reference_points, self.embed_dims//2))
-        ## Init Prediction
-        agent_query = self.agent_prep_decoder(
-            agent_query,
-            img_feats,
-            agent_pe,
-            img_pos_embed,
-        )
-        # get preliminary reference points for detection
-        agent_query = agent_query.float()
-        agent_prep_class = self.cls_branches[-1](agent_query)
-        agent_prep_ref = self.reg_branches[-1](agent_query + agent_pe)
-        agent_prep_ref[..., 0:2] = agent_prep_ref[..., 0:2] + agent_reference_points[..., :2]
-        agent_prep_ref[..., 4:5] = agent_prep_ref[..., 4:5] + agent_reference_points[..., 2:3]
 
-        map_pe = self.map_ref_embedding(pos2posemb(map_reference_points, self.embed_dims//2))
-        map_query = self.map_prep_decoder(
-            map_query,
-            img_feats,
-            map_pe,
-            img_pos_embed,
-        )
-        map_query = map_query.float()
-        # get preliminary reference points for map
-        map_prep_class = self.map_cls_branches[-1](map_query)
-        map_prep_pts_coord = self.map_reg_branches[-1](map_query + map_pe)
-        map_prep_pts_coord = map_prep_pts_coord.view(map_query.shape[0], map_query.shape[1], -1, 2) + map_reference_points.unsqueeze(-2)
-        map_prep_box, map_prep_ref  = map_transform_box(map_prep_pts_coord.unsqueeze(0))
-        # get preliminary reference points for motion
-        mode_query = self.mode_embedding.weight.unsqueeze(0).expand(bs, -1, -1)
-        agent_query_mode = (agent_query.unsqueeze(2) + mode_query.unsqueeze(1))
-        agent_prep_traj_ref = self.traj_branches[-1](agent_query_mode).view(bs, agent_query_mode.shape[1], agent_query_mode.shape[2], self.fut_ts, 2) # [bs, num*mode, fut_ts, 2]
-        agent_prep_traj_cls = self.traj_cls_branches[-1](agent_query_mode)
+        # Wrap in no_grad when only finetuning diffusion to save memory
+        if self.only_finetune_diffusion:
+            with torch.no_grad():
+                ## Init PE
+                agent_pe = self.agent_ref_embedding(pos2posemb(agent_reference_points, self.embed_dims//2))
+                ## Init Prediction
+                agent_query = self.agent_prep_decoder(
+                    agent_query,
+                    img_feats,
+                    agent_pe,
+                    img_pos_embed,
+                )
+                # get preliminary reference points for detection
+                agent_query = agent_query.float()
+                agent_prep_class = self.cls_branches[-1](agent_query)
+                agent_prep_ref = self.reg_branches[-1](agent_query + agent_pe)
+                agent_prep_ref[..., 0:2] = agent_prep_ref[..., 0:2] + agent_reference_points[..., :2]
+                agent_prep_ref[..., 4:5] = agent_prep_ref[..., 4:5] + agent_reference_points[..., 2:3]
 
-        ## Planning
-        ## ego_lcf_feat: (vx, vy, ax, ay, w, length, width, vel, steer)
-        ego_query = self.ego_lcf_encoder(torch.cat([ego_lcf_feat.squeeze(1)[..., self.ego_lcf_feat_idx], ego_his_trajs.flatten(-2, -1), ego_fut_cmd.squeeze(1)], dim=-1)) # [B,1,D]
-        if len(ego_query.shape) == 2:
-            ego_query = ego_query.unsqueeze(0)
-            
-        if self.ego_multi_modal:
-            mode_anchor_ref = self.anchor_ref.unsqueeze(0).expand(bs, -1, -1, -1)
-            ego_mode_query = self.mode_mlp(pos2posemb(mode_anchor_ref[...,0:2], self.embed_dims//2))  
-            ego_query = (ego_query.unsqueeze(2) + ego_mode_query.unsqueeze(1)).flatten(1,2) # [B,N_mode,D]
-        # get preliminary reference points for planning
-        ego_ref = torch.zeros((ego_query.shape[0], ego_query.shape[1], 3),device=ego_query.device, dtype=ego_query.dtype) 
-        ego_prep_traj_ref_fix_time = self.ego_traj_branches_fix_time[-1](ego_query).view(bs, ego_query.shape[1], self.fut_ts_ego_fix_time, 2)         
-        ego_prep_traj_ref_fix_dist = self.ego_traj_branches_fix_dist[-1](ego_query).view(bs, ego_query.shape[1], self.fut_ts_ego_fix_dist, 1) if self.fut_ego_fix_dist else None
-        ego_prep_traj_cls = self.traj_cls_branches[-1](ego_query) if self.ego_multi_modal else None
+                map_pe = self.map_ref_embedding(pos2posemb(map_reference_points, self.embed_dims//2))
+                map_query = self.map_prep_decoder(
+                    map_query,
+                    img_feats,
+                    map_pe,
+                    img_pos_embed,
+                )
+                map_query = map_query.float()
+                # get preliminary reference points for map
+                map_prep_class = self.map_cls_branches[-1](map_query)
+                map_prep_pts_coord = self.map_reg_branches[-1](map_query + map_pe)
+                map_prep_pts_coord = map_prep_pts_coord.view(map_query.shape[0], map_query.shape[1], -1, 2) + map_reference_points.unsqueeze(-2)
+                map_prep_box, map_prep_ref  = map_transform_box(map_prep_pts_coord.unsqueeze(0))
+                # get preliminary reference points for motion
+                mode_query = self.mode_embedding.weight.unsqueeze(0).expand(bs, -1, -1)
+                agent_query_mode = (agent_query.unsqueeze(2) + mode_query.unsqueeze(1))
+                agent_prep_traj_ref = self.traj_branches[-1](agent_query_mode).view(bs, agent_query_mode.shape[1], agent_query_mode.shape[2], self.fut_ts, 2) # [bs, num*mode, fut_ts, 2]
+                agent_prep_traj_cls = self.traj_cls_branches[-1](agent_query_mode)
+
+                ## Planning
+                ## ego_lcf_feat: (vx, vy, ax, ay, w, length, width, vel, steer)
+                ego_query = self.ego_lcf_encoder(torch.cat([ego_lcf_feat.squeeze(1)[..., self.ego_lcf_feat_idx], ego_his_trajs.flatten(-2, -1), ego_fut_cmd.squeeze(1)], dim=-1)) # [B,1,D]
+                if len(ego_query.shape) == 2:
+                    ego_query = ego_query.unsqueeze(0)
+
+                if self.ego_multi_modal:
+                    mode_anchor_ref = self.anchor_ref.unsqueeze(0).expand(bs, -1, -1, -1)
+                    ego_mode_query = self.mode_mlp(pos2posemb(mode_anchor_ref[...,0:2], self.embed_dims//2))
+                    ego_query = (ego_query.unsqueeze(2) + ego_mode_query.unsqueeze(1)).flatten(1,2) # [B,N_mode,D]
+                # get preliminary reference points for planning
+                ego_ref = torch.zeros((ego_query.shape[0], ego_query.shape[1], 3),device=ego_query.device, dtype=ego_query.dtype)
+                ego_prep_traj_ref_fix_time = self.ego_traj_branches_fix_time[-1](ego_query).view(bs, ego_query.shape[1], self.fut_ts_ego_fix_time, 2)
+                ego_prep_traj_ref_fix_dist = self.ego_traj_branches_fix_dist[-1](ego_query).view(bs, ego_query.shape[1], self.fut_ts_ego_fix_dist, 1) if self.fut_ego_fix_dist else None
+                ego_prep_traj_cls = self.traj_cls_branches[-1](ego_query) if self.ego_multi_modal else None
+            # Detach to prevent gradient flow
+            agent_query = agent_query.detach()
+            agent_pe = agent_pe.detach()
+            agent_prep_class = agent_prep_class.detach()
+            agent_prep_ref = agent_prep_ref.detach()
+            map_query = map_query.detach()
+            map_pe = map_pe.detach()
+            map_prep_class = map_prep_class.detach()
+            map_prep_pts_coord = map_prep_pts_coord.detach()
+            mode_query = mode_query.detach()
+            agent_prep_traj_ref = agent_prep_traj_ref.detach()
+            agent_prep_traj_cls = agent_prep_traj_cls.detach()
+            ego_query = ego_query.detach()
+            ego_prep_traj_ref_fix_time = ego_prep_traj_ref_fix_time.detach()
+            if ego_prep_traj_ref_fix_dist is not None:
+                ego_prep_traj_ref_fix_dist = ego_prep_traj_ref_fix_dist.detach()
+            if ego_prep_traj_cls is not None:
+                ego_prep_traj_cls = ego_prep_traj_cls.detach()
+        else:
+            ## Init PE
+            agent_pe = self.agent_ref_embedding(pos2posemb(agent_reference_points, self.embed_dims//2))
+            ## Init Prediction
+            agent_query = self.agent_prep_decoder(
+                agent_query,
+                img_feats,
+                agent_pe,
+                img_pos_embed,
+            )
+            # get preliminary reference points for detection
+            agent_query = agent_query.float()
+            agent_prep_class = self.cls_branches[-1](agent_query)
+            agent_prep_ref = self.reg_branches[-1](agent_query + agent_pe)
+            agent_prep_ref[..., 0:2] = agent_prep_ref[..., 0:2] + agent_reference_points[..., :2]
+            agent_prep_ref[..., 4:5] = agent_prep_ref[..., 4:5] + agent_reference_points[..., 2:3]
+
+            map_pe = self.map_ref_embedding(pos2posemb(map_reference_points, self.embed_dims//2))
+            map_query = self.map_prep_decoder(
+                map_query,
+                img_feats,
+                map_pe,
+                img_pos_embed,
+            )
+            map_query = map_query.float()
+            # get preliminary reference points for map
+            map_prep_class = self.map_cls_branches[-1](map_query)
+            map_prep_pts_coord = self.map_reg_branches[-1](map_query + map_pe)
+            map_prep_pts_coord = map_prep_pts_coord.view(map_query.shape[0], map_query.shape[1], -1, 2) + map_reference_points.unsqueeze(-2)
+            map_prep_box, map_prep_ref  = map_transform_box(map_prep_pts_coord.unsqueeze(0))
+            # get preliminary reference points for motion
+            mode_query = self.mode_embedding.weight.unsqueeze(0).expand(bs, -1, -1)
+            agent_query_mode = (agent_query.unsqueeze(2) + mode_query.unsqueeze(1))
+            agent_prep_traj_ref = self.traj_branches[-1](agent_query_mode).view(bs, agent_query_mode.shape[1], agent_query_mode.shape[2], self.fut_ts, 2) # [bs, num*mode, fut_ts, 2]
+            agent_prep_traj_cls = self.traj_cls_branches[-1](agent_query_mode)
+
+            ## Planning
+            ## ego_lcf_feat: (vx, vy, ax, ay, w, length, width, vel, steer)
+            ego_query = self.ego_lcf_encoder(torch.cat([ego_lcf_feat.squeeze(1)[..., self.ego_lcf_feat_idx], ego_his_trajs.flatten(-2, -1), ego_fut_cmd.squeeze(1)], dim=-1)) # [B,1,D]
+            if len(ego_query.shape) == 2:
+                ego_query = ego_query.unsqueeze(0)
+
+            if self.ego_multi_modal:
+                mode_anchor_ref = self.anchor_ref.unsqueeze(0).expand(bs, -1, -1, -1)
+                ego_mode_query = self.mode_mlp(pos2posemb(mode_anchor_ref[...,0:2], self.embed_dims//2))
+                ego_query = (ego_query.unsqueeze(2) + ego_mode_query.unsqueeze(1)).flatten(1,2) # [B,N_mode,D]
+            # get preliminary reference points for planning
+            ego_ref = torch.zeros((ego_query.shape[0], ego_query.shape[1], 3),device=ego_query.device, dtype=ego_query.dtype)
+            ego_prep_traj_ref_fix_time = self.ego_traj_branches_fix_time[-1](ego_query).view(bs, ego_query.shape[1], self.fut_ts_ego_fix_time, 2)
+            ego_prep_traj_ref_fix_dist = self.ego_traj_branches_fix_dist[-1](ego_query).view(bs, ego_query.shape[1], self.fut_ts_ego_fix_dist, 1) if self.fut_ego_fix_dist else None
+            ego_prep_traj_cls = self.traj_cls_branches[-1](ego_query) if self.ego_multi_modal else None
         # major transformer
         if self.only_finetune_diffusion:
             with torch.no_grad():
@@ -1997,26 +2137,34 @@ class DriveTransformerlHead(BaseModule):
                 loss_plan_cls_list.append(loss_plan_cls)
         return loss_plan_reg_fix_time_list, loss_plan_reg_fix_dist_list, loss_plan_cls_list
 
-    def loss_diffusion(self, 
+    def loss_diffusion(self,
                        intermediate_agent_query,
                        intermediate_map_query,
                        intermediate_ego_query,
+                       intermediate_agent_cls=None,
+                       intermediate_map_cls=None,
                        ego_fut_gt=None,
-                       ego_fut_mask=None):
+                       ego_fut_mask=None,
+                       topk_agent=5,
+                       topk_map=5):
         """
         Compute diffusion loss using trajectory tokens with cross-attention.
-        
+
         Creates trajectory tokens that attend to all intermediate query tokens
         at each decoder layer, using the diffusion scheduler for forward/reverse
         process and the trajectory denoiser for noise prediction.
-        
+
         Args:
             intermediate_agent_query: [N_layers+1, B, N_agent_query, D]
-            intermediate_map_query: [N_layers+1, B, N_map_query, D]  
+            intermediate_map_query: [N_layers+1, B, N_map_query, D]
             intermediate_ego_query: [N_layers+1, B, N_ego_mode, D]
+            intermediate_agent_cls: [N_layers+1, B, N_agent_query, N_classes] classification scores
+            intermediate_map_cls: [N_layers+1, B, N_map_query, N_classes] classification scores
             ego_fut_gt: Ground truth ego future trajectory [B, N_future_time, 2]
             ego_fut_mask: Mask for valid trajectory points [B, N_future_time]
-        
+            topk_agent: Number of top-k agent tokens to use (default: 20)
+            topk_map: Number of top-k map tokens to use (default: 20)
+
         Returns:
             loss_diffusion: Scalar diffusion loss
         """
@@ -2088,18 +2236,23 @@ class DriveTransformerlHead(BaseModule):
         # Normalize trajectory: convert to differential and apply per-timestep normalization
         clean_traj = self.diffusion_head.normalize_trajectory(clean_traj)  # [B, N_traj_tokens, 2]
         
-        DEBUG = True
+        DEBUG = False
         if DEBUG:
             # record the clean traj for debugging
             json_debug_path = 'debug_clean_traj_json.json'
-            if os.path.exists(json_debug_path):
-                with open(json_debug_path, 'r') as f:
-                    debug_data = json.load(f)
-            else:
-                debug_data = {}
-            debug_data[f'clean_traj_{len(debug_data)}'] = clean_traj[0].cpu().numpy().tolist()
-            with open(json_debug_path, 'w') as f:
-                json.dump(debug_data, f, indent=2)
+            debug_data = {}
+            if os.path.exists(json_debug_path) and os.path.getsize(json_debug_path) > 0:
+                try:
+                    with open(json_debug_path, 'r') as f:
+                        debug_data = json.load(f)
+                except (json.JSONDecodeError, ValueError):
+                    pass  # If file is corrupted, just start fresh
+            try:
+                debug_data[f'clean_traj_{len(debug_data)}'] = clean_traj[0].cpu().numpy().tolist()
+                with open(json_debug_path, 'w') as f:
+                    json.dump(debug_data, f, indent=2)
+            except Exception:
+                pass  # Silently skip debug logging if it fails
 
         # Flatten trajectory: [B, N_traj_tokens, 2] -> [B, N_traj_tokens * 2]
         clean_traj = clean_traj.flatten(-2)  # [B, N_traj_tokens * 2]
@@ -2123,7 +2276,7 @@ class DriveTransformerlHead(BaseModule):
         assert noise.shape == clean_traj.shape, \
             f"noise shape mismatch: expected {clean_traj.shape}, got {noise.shape}"
                 
-        # Build list of contexts (one per layer) so we can call the denoiser once. 
+        # Build list of contexts (one per layer) so we can call the denoiser once.
         # Each context is a tensor of tokens to cross attend over
         contexts = []
         for layer_idx in range(num_layers):
@@ -2134,6 +2287,31 @@ class DriveTransformerlHead(BaseModule):
             # Assert layer query shapes
             assert ego_query_tokens_at_layer.dim() == 3, \
                 f"ego_query_tokens_at_layer should be 3D [B, N_ego, D], got {ego_query_tokens_at_layer.shape}"
+
+            # Apply top-k selection to reduce memory usage
+            # Select top-k agent tokens based on classification scores (using sigmoid + topk like in post_update_memory)
+            if agent_query_tokens_at_layer is not None and intermediate_agent_cls is not None:
+                agent_cls_at_layer = intermediate_agent_cls[layer_idx]  # [B, N_agent, N_classes]
+                # Get confidence score: apply sigmoid and take max across classes
+                agent_scores = agent_cls_at_layer.sigmoid().topk(1, dim=-1).values.squeeze(-1)  # [B, N_agent]
+                # Select top-k agents
+                k_agent = min(topk_agent, agent_scores.shape[1])
+                _, topk_agent_indices = torch.topk(agent_scores, k_agent, dim=1)  # [B, k_agent]
+                # Gather top-k agent tokens
+                topk_agent_indices_expanded = topk_agent_indices.unsqueeze(-1).expand(-1, -1, self.embed_dims)
+                agent_query_tokens_at_layer = torch.gather(agent_query_tokens_at_layer, 1, topk_agent_indices_expanded)  # [B, k_agent, D]
+
+            # Select top-k map tokens based on classification scores
+            if map_query_tokens_at_layer is not None and intermediate_map_cls is not None:
+                map_cls_at_layer = intermediate_map_cls[layer_idx]  # [B, N_map, N_classes]
+                # Get confidence score: apply sigmoid and take max across classes
+                map_scores = map_cls_at_layer.sigmoid().topk(1, dim=-1).values.squeeze(-1)  # [B, N_map]
+                # Select top-k map elements
+                k_map = min(topk_map, map_scores.shape[1])
+                _, topk_map_indices = torch.topk(map_scores, k_map, dim=1)  # [B, k_map]
+                # Gather top-k map tokens
+                topk_map_indices_expanded = topk_map_indices.unsqueeze(-1).expand(-1, -1, self.embed_dims)
+                map_query_tokens_at_layer = torch.gather(map_query_tokens_at_layer, 1, topk_map_indices_expanded)  # [B, k_map, D]
 
             # Concatenate all queries to form context for cross-attention
             context_list = []
@@ -2770,12 +2948,18 @@ class DriveTransformerlHead(BaseModule):
             intermediate_agent_query = preds_dicts.get('intermediate_agent_query', None)
             intermediate_map_query = preds_dicts.get('intermediate_map_query', None)
             intermediate_ego_query = preds_dicts.get('intermediate_ego_query', None)
+            intermediate_agent_cls = preds_dicts.get('all_cls_scores', None)  # [N_layers+1, B, N_agent, N_classes]
+            intermediate_map_cls = preds_dicts.get('map_all_cls_scores', None)  # [N_layers+1, B, N_map, N_classes]
             loss_diffusion = self.loss_diffusion(
                 intermediate_agent_query,
                 intermediate_map_query,
                 intermediate_ego_query,
+                intermediate_agent_cls=intermediate_agent_cls,
+                intermediate_map_cls=intermediate_map_cls,
                 ego_fut_gt=ego_fut_gt_fix_time,  # [B, N_future_time, 2]
-                ego_fut_mask=ego_fut_masks_fix_time  # [B, N_future_time]
+                ego_fut_mask=ego_fut_masks_fix_time,  # [B, N_future_time]
+                topk_agent=5,  # Use top 5 agent tokens (vs 100 total)
+                topk_map=5     # Use top 5 map tokens (vs 100 total)
             )
             loss_dict = dict()
             if loss_diffusion is not None:

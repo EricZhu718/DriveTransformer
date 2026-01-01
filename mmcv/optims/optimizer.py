@@ -257,7 +257,9 @@ class DefaultOptimizerConstructor:
         optimizer_cfg = self.optimizer_cfg.copy()
         # if no paramwise option is specified, just use the global setting
         if not self.paramwise_cfg:
-            optimizer_cfg['params'] = model.parameters()
+            # Eric: Changed to only include trainable parameters (skip frozen params)
+            # optimizer_cfg['params'] = model.parameters()
+            optimizer_cfg['params'] = [p for p in model.parameters() if p.requires_grad]
             return build_from_cfg(optimizer_cfg, OPTIMIZERS)
 
         # set param-wise lr and weight decay recursively

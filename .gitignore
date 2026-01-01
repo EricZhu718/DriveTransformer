@@ -159,3 +159,5 @@ tmp_ckpts/
 val/
 *.ipynb
 .vscode
+
+debug_clean_traj_json.json

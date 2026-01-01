@@ -54,6 +54,15 @@ class DriveTransformer(MVXTwoStageDetector):
         self.planning_metric = None
         self.test_flag = False
         self.position_level = 0
+
+        # Freeze image backbone and neck if only finetuning diffusion head
+        if hasattr(self.pts_bbox_head, 'only_finetune_diffusion') and self.pts_bbox_head.only_finetune_diffusion:
+            if self.img_backbone is not None:
+                for param in self.img_backbone.parameters():
+                    param.requires_grad = False
+            if self.img_neck is not None:
+                for param in self.img_neck.parameters():
+                    param.requires_grad = False
     
     @force_fp32()
     def forward(self, data, return_loss=True, **kwargs):
