@@ -209,17 +209,22 @@ class DiffusionScheduler(nn.Module):
         # Predict x_0 from noise
         alpha_t = self._extract(self.alphas_cumprod, t, x_t.shape)
         x_0_pred = (x_t - torch.sqrt(1 - alpha_t) * predicted_noise) / torch.sqrt(alpha_t)
-        
+
         if clip_denoised:
             x_0_pred = torch.clamp(x_0_pred, -1.0, 1.0)
-        
+
+        # Special case: if at t=0, we're already at the clean sample
+        # Avoid numerical instability from division by zero when alpha_t == alpha_prev
+        if torch.all(t == 0):
+            return x_0_pred
+
         # Get alpha for previous timestep
         if t_prev is None:
             t_prev = torch.clamp(t - 1, min=0)
-        
+
         alpha_prev = self._extract(self.alphas_cumprod, t_prev, x_t.shape)
-        
-        # DDIM forward: x_{t-1} = sqrt(alpha_{t-1}) * x_0 + sqrt(1 - alpha_{t-1}) * eps
+
+        # DDIM forward: x_{t-1} = sqrt(alpha_{t-1}) * x_0 + sqrt(1 - alpha_{t-1} - sigma^2) * eps
         # with optional stochasticity controlled by eta
         sigma_t = eta * torch.sqrt((1 - alpha_prev) / (1 - alpha_t)) * torch.sqrt(1 - alpha_t / alpha_prev)
         
@@ -1524,6 +1529,12 @@ class DriveTransformerlHead(BaseModule):
             'intermediate_map_query': intermediate_map_query, # [N_layers+1, B, N_map_query, D] (includes initial)
             'intermediate_ego_query': intermediate_ego_query, # [N_layers+1, B, N_ego_mode, D] (includes initial)
         }
+
+        # add the intermedaite outputs for inference
+        self.intermediate_agent_query = intermediate_agent_query
+        self.intermediate_map_query = intermediate_map_query
+        self.intermediate_ego_query = intermediate_ego_query
+
         return outs
         
     def reset_memory(self):
@@ -2367,62 +2378,121 @@ class DriveTransformerlHead(BaseModule):
         # Average across layers and apply weight
         total_loss = torch.stack(layer_losses).mean() * self.diffusion_loss_weight
         return total_loss
-    
-    # @torch.no_grad()
-    # def diffusion_sample(self, 
-    #                      intermediate_agent_query,
-    #                      intermediate_map_query,
-    #                      intermediate_ego_query,
-    #                      num_steps=None):
-    #     """
-    #     Generate trajectory samples using the reverse diffusion process.
-    #     Operates in flattened coordinate space [B, N_timesteps * 2].
-        
-    #     Args:
-    #         intermediate_agent_query: [N_layers+1, B, N_agent_query, D]
-    #         intermediate_map_query: [N_layers+1, B, N_map_query, D]
-    #         intermediate_ego_query: [N_layers+1, B, N_ego_mode, D]
-    #         num_steps: Number of denoising steps (default: all timesteps)
-        
-    #     Returns:
-    #         sampled_traj: Generated trajectory coordinates [B, N_timesteps * 2] (flattened)
-    #     """
-    #     if not self.use_diffusion_loss:
-    #         return None
-        
-    #     batch_size = intermediate_ego_query.shape[1]
-    #     device = intermediate_ego_query.device
-    #     num_layers = len(self.trajectory_denoisers)
-        
-    #     # Use final layer queries as context
-    #     agent_query = intermediate_agent_query[-1] if intermediate_agent_query is not None else None
-    #     map_query = intermediate_map_query[-1] if intermediate_map_query is not None else None
-    #     ego_query = intermediate_ego_query[-1]
-        
-    #     # Build context
-    #     context_list = []
-    #     if agent_query is not None:
-    #         context_list.append(agent_query)
-    #     if map_query is not None:
-    #         context_list.append(map_query)
-    #     context_list.append(ego_query)
-    #     context = torch.cat(context_list, dim=1)
-        
-    #     # Define denoising function that uses the final layer's denoiser
-    #     def denoise_fn(x_t, t):
-    #         return self.trajectory_denoisers[-1](x_t, t, context)
-        
-    #     # Generate samples in flattened coordinate space [B, N_timesteps * 2]
-    #     shape = (batch_size, self.diffusion_num_traj_tokens * 2)
-    #     sampled_traj = self.diffusion_scheduler.p_sample_loop(
-    #         denoise_fn=denoise_fn,
-    #         shape=shape,
-    #         context=context,
-    #         clip_denoised=False,
-    #         device=device
-    #     )
-        
-    #     return sampled_traj
+
+    @torch.no_grad()
+    def sample_trajectory_from_noise(self,
+                                     contexts,
+                                     batch_size=1,
+                                     num_inference_steps=50,
+                                     eta=0.0,
+                                     clip_denoised=False,
+                                     device=None):
+        """
+        Generate trajectory samples from pure Gaussian noise using DDIM sampling.
+
+        This implements the complete reverse diffusion process: noise -> clean trajectory.
+
+        Process:
+        1. Start with pure Gaussian noise [B, num_traj_tokens * 2]
+        2. For each timestep t from T to 0:
+           a. Tokenize the noisy trajectory with timestep embedding
+           b. Use diffusion_head to predict noise via cross-attention with contexts
+           c. Accumulate predictions from all layers (iterative refinement)
+           d. Use scheduler.p_sample to compute x_{t-1} from x_t and predicted noise
+        3. Return final clean trajectory in normalized differential space
+
+        Args:
+            contexts: List of context tensors, one per decoder layer.
+                     Each should be [B, N_tokens, D]. Example:
+                     [context_layer0, context_layer1, ..., context_layerN]
+                     where N = num_contexts in diffusion_head
+            batch_size: Number of trajectories to generate
+            num_inference_steps: Number of denoising steps (fewer = faster, lower quality)
+            eta: DDIM stochasticity (0.0 = deterministic, 1.0 = stochastic like DDPM)
+            clip_denoised: Whether to clip predicted clean trajectories to [-1, 1]
+            device: Device to generate on (defaults to diffusion_scheduler device)
+
+        Returns:
+            trajectories: Generated trajectory [B, num_traj_tokens * 2] in normalized differential space
+                         Can be unnormalized using diffusion_head.unnormalize_trajectory()
+        """
+        if not self.use_diffusion_loss:
+            raise RuntimeError("Diffusion not enabled. Set use_diffusion_loss=True in config.")
+
+        if device is None:
+            device = self.diffusion_scheduler.betas.device
+
+        # Validate contexts
+        if not isinstance(contexts, list):
+            raise ValueError("contexts must be a list of tensors")
+        if len(contexts) != self.diffusion_head.num_contexts:
+            raise ValueError(f"Expected {self.diffusion_head.num_contexts} contexts, got {len(contexts)}")
+        for ctx in contexts:
+            if ctx.shape[0] != batch_size:
+                raise ValueError(f"Context batch size {ctx.shape[0]} != requested {batch_size}")
+
+        # Start from pure Gaussian noise [B, num_traj_tokens * 2]
+        x = torch.randn(batch_size, self.diffusion_num_traj_tokens * 2, device=device)
+
+        # Create timestep schedule for DDIM (uniform spacing for faster inference)
+        total_timesteps = self.diffusion_num_timesteps
+        if num_inference_steps >= total_timesteps:
+            timesteps = list(reversed(range(total_timesteps)))
+        else:
+            step_size = total_timesteps // num_inference_steps
+            timesteps = list(reversed(range(0, total_timesteps, step_size)))
+
+        # Define denoising function for the scheduler
+        def denoise_fn(x_t, t, context=None):
+            """
+            Predict noise from noisy trajectory x_t at timestep t.
+
+            Args:
+                x_t: Noisy trajectory [B, num_traj_tokens * 2]
+                t: Timestep tensor [B]
+                context: Not used (contexts are captured in closure)
+
+            Returns:
+                predicted_noise: [B, num_traj_tokens * 2]
+            """
+            # Tokenize the current noisy trajectory with timestep embedding
+            tokens = self.diffusion_head.tokenize(x_t, t)  # [B, num_traj_tokens, D]
+
+            # Denoise with all contexts (gets predictions from each layer)
+            # predicted_noises: [L, B, traj_flat_dim]
+            predicted_noises, _ = self.diffusion_head.denoise_with_contexts(tokens, contexts)
+
+            # Accumulate predictions from all layers (iterative refinement like in training)
+            predicted_noise_cumulative = torch.zeros_like(x_t)
+            for layer_idx in range(predicted_noises.shape[0]):
+                predicted_noise_delta = predicted_noises[layer_idx]
+                predicted_noise_cumulative = predicted_noise_cumulative + predicted_noise_delta
+
+            return predicted_noise_cumulative
+
+        # Iterative denoising: T -> 0
+        for i, t_val in enumerate(timesteps):
+            t = torch.full((batch_size,), t_val, device=device, dtype=torch.long)
+
+            # Get previous timestep
+            if i + 1 < len(timesteps):
+                t_prev_val = timesteps[i + 1]
+                t_prev = torch.full((batch_size,), t_prev_val, device=device, dtype=torch.long)
+            else:
+                t_prev = None
+
+            # Use scheduler's p_sample to compute x_{t-1}
+            x = self.diffusion_scheduler.p_sample(
+                denoise_fn=denoise_fn,
+                x_t=x,
+                t=t,
+                t_prev=t_prev,
+                context=None,  # Not used, contexts captured in closure
+                clip_denoised=clip_denoised,
+                eta=eta
+            )
+
+        return x
     
     def loss_single(self,
                     cls_scores,
