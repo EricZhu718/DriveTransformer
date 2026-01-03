@@ -15,7 +15,8 @@ import carla
 import numpy as np
 from PIL import Image
 from torchvision import transforms as T
-from DriveTransformer.team_code.pid_controller import DecouplePIDController
+# from DriveTransformer.team_code.pid_controller import DecouplePIDController
+from DriveTransformer.team_code.pure_pursuit_controller import PurePursuitController
 from leaderboard.autoagents import autonomous_agent
 from mmcv import Config
 from mmcv.models import build_model
@@ -46,7 +47,10 @@ class DriveTransformerAgentDiffusion_Small_MLP(autonomous_agent.AutonomousAgent)
     """
     def setup(self, path_to_conf_file):
         self.track = autonomous_agent.Track.SENSORS
-        self.controller = DecouplePIDController(speed_k_p=2.0, speed_k_i=0.8, speed_k_d=1.5, steer_k_p=1.5, steer_k_i=0.2, steer_k_d=0.2)
+        # self.controller = DecouplePIDController(speed_k_p=2.0, speed_k_i=0.8, speed_k_d=1.5, steer_k_p=1.5, steer_k_i=0.2, steer_k_d=0.2)
+        self.controller = PurePursuitController(lookahead_distance=4.0, wheelbase=2.89, max_throttle=0.75,
+                                                brake_speed=0.4, brake_ratio=1.0, speed_KP=5.0, speed_KI=0.5,
+                                                speed_KD=1.0, speed_n=40, clip_delta=0.25)
         self.config_path = path_to_conf_file.split('+')[0]
         self.ckpt_path = path_to_conf_file.split('+')[1]
         if IS_BENCH2DRIVE:
@@ -783,7 +787,11 @@ class DriveTransformerAgentDiffusion_Small_MLP(autonomous_agent.AutonomousAgent)
         if self.step <= 20: # waiting for scenerio initialization (cars are more likely to disappear suddenly in this period)
             steer, throttle, brake = 0.0, 0.0, 1.0
         else:
-            steer, throttle, brake = self.controller.step(ego_traj_fix_time, ego_traj_fix_dist, tick_data['speed']) # controller
+            # steer, throttle, brake = self.controller.step(ego_traj_fix_time, ego_traj_fix_dist, tick_data['speed']) # PID controller
+            # Pure Pursuit controller: truncate trajectory to first 10 waypoints
+            truncated_traj = ego_traj_fix_time[:10]
+            steer, throttle, brake, metadata = self.controller.control_pid(truncated_traj, tick_data['speed'], truncated_traj[-1])
+
         control = carla.VehicleControl(steer=float(steer), throttle=float(throttle), brake=float(brake))
         self.pid_metadata['steer'] = control.steer
         self.pid_metadata['throttle'] = control.throttle

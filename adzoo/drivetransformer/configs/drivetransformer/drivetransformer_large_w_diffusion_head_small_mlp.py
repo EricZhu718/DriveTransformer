@@ -133,7 +133,7 @@ map_num_propagated = 50
 memory_len_frame = 10
 num_mode = 6
 num_gpus = 4
-batch_size = 6
+batch_size = 10
 num_iters_per_epoch = 200000 // (num_gpus * batch_size)
 
 data_aug_conf = {
@@ -572,7 +572,7 @@ log_config = dict(
     ])
 fp16 = dict(loss_scale=512.)
 find_unused_parameters = True
-checkpoint_config = dict(interval=3000)
+checkpoint_config = dict(interval=10000)
 
 custom_hooks = [dict(type='CustomSetEpochInfoHook')]
 

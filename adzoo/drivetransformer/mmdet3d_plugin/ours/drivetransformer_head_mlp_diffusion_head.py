@@ -673,7 +673,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         diffusion_loss_type='mse',  # 'mse' or 'l1'
         diffusion_num_traj_tokens=30,  # Number of trajectory tokens for denoiser
         diffusion_num_heads=2,
-        diffusion_ffn_dim=256,
+        diffusion_ffn_dim=1024,
         ## Cfg
         train_cfg=None,
         test_cfg=None,
