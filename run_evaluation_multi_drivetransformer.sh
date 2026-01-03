@@ -2,11 +2,11 @@ BASE_PORT=30000
 BASE_TM_PORT=50000
 IS_BENCH2DRIVE=True
 BASE_ROUTES=leaderboard/data/bench2drive220
-TEAM_AGENT=team_code/drivetransformer_b2d_agent_diffusion.py
-TEAM_CONFIG=DriveTransformer/adzoo/drivetransformer/configs/drivetransformer/drivetransformer_large_w_diffusion_head.py+/zfsauton2/home/ezhu3/Bench2Drive/DriveTransformer/adzoo/drivetransformer/work_dirs/drivetransformer/drivetransformer_large_w_diffusion_head/latest.pth
+TEAM_AGENT=team_code/drivetransformer_b2d_agent_diffusion_small_mlp.py
+TEAM_CONFIG=DriveTransformer/adzoo/drivetransformer/configs/drivetransformer/drivetransformer_large_w_diffusion_head_small_mlp.py+/lustre/scratch/ezhu3/drive_transformer_work_dir/latest.pth
 BASE_CHECKPOINT_ENDPOINT=eval_bench2drive220
 PLANNER_TYPE=only_traj
-ALGO=DriveTransformer_Diffusion
+ALGO=DriveTransformerAgentDiffusion_Small_MLP
 SAVE_PATH=./eval_bench2drive220_${ALGO}_${PLANNER_TYPE}
 
 export PYTHONPATH="/zfsauton2/home/ezhu3/Bench2Drive/DriveTransformer:${PYTHONPATH}"

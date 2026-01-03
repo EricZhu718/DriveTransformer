@@ -14,8 +14,9 @@ MASTER_PORT=${MASTER_PORT:-35201}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 RANK=${RANK:-0}
 
-export WORK_DIR=$(echo ${CFG%.*} | sed -e "s/configs/work_dirs/g")/
+# export WORK_DIR=$(echo ${CFG%.*} | sed -e "s/configs/work_dirs/g")/
 # Intermediate files and logs will be saved to UniAD/projects/work_dirs/
+export WORK_DIR="/lustre/scratch/ezhu3/drive_transformer_work_dir/"
 
 if [ ! -d ${WORK_DIR}logs ]; then
     mkdir -p ${WORK_DIR}logs
