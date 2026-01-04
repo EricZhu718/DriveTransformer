@@ -301,6 +301,10 @@ class DiffusionHead(nn.Module):
     Simple MLP-based denoiser network that predicts noise for trajectory diffusion.
     Takes noised trajectory (flattened coordinates) + ego token + timestep embedding,
     and outputs predicted noise through a simple MLP.
+
+    The ego tokens are processed through ego_traj_branches_fix_time (without the final
+    output layer) to extract rich trajectory-relevant features before being used for
+    noise prediction.
     """
     def __init__(self,
                  embed_dims=256,
@@ -308,13 +312,15 @@ class DiffusionHead(nn.Module):
                  num_timesteps=1000,  # total diffusion timesteps for normalization
                  dropout=0.1,
                  ffn_dim=1024,
-                 num_contexts=1):
+                 num_contexts=1,
+                 ego_traj_branches_fix_time=None):
         super().__init__()
         self.embed_dims = embed_dims
         self.num_traj_tokens = num_traj_tokens
         self.num_timesteps = num_timesteps
         self.traj_flat_dim = num_traj_tokens * 2  # flattened trajectory dimension
         self.num_contexts = num_contexts
+        self.ego_traj_branches_fix_time = ego_traj_branches_fix_time
 
         # Project noised trajectory to same dimension as ego token
         self.traj_proj = nn.Linear(self.traj_flat_dim, embed_dims)
@@ -579,8 +585,18 @@ class DiffusionHead(nn.Module):
             assert ego_token.dim() == 2 and ego_token.shape[0] == B and ego_token.shape[1] == self.embed_dims, \
                 f"each ego_token must be [B, {self.embed_dims}], got {ego_token.shape}"
 
+            # Process ego_token through ego_traj_branches_fix_time (without final layer)
+            if self.ego_traj_branches_fix_time is not None:
+                ego_traj_branch = self.ego_traj_branches_fix_time[i]
+                # Pass through all layers except the final Linear layer
+                ego_token_processed = ego_token
+                for module in ego_traj_branch[:-1]:  # Exclude the final Linear layer
+                    ego_token_processed = module(ego_token_processed)
+            else:
+                ego_token_processed = ego_token
+
             # Concatenate: projected_traj + ego_token + time_emb
-            mlp_input = torch.cat([traj_embed, ego_token, t_emb], dim=-1)  # [B, 3 * embed_dims]
+            mlp_input = torch.cat([traj_embed, ego_token_processed, t_emb], dim=-1)  # [B, 3 * embed_dims]
 
             # Pass through MLP to predict noise
             predicted_noise = self.denoise_mlps[i](mlp_input)  # [B, traj_flat_dim]
@@ -1083,7 +1099,8 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
                 num_timesteps=self.diffusion_num_timesteps,
                 dropout=0.1,
                 ffn_dim=self.diffusion_ffn_dim,
-                num_contexts=num_mixed_up_layers + 1  # +1 for initial token state
+                num_contexts=num_mixed_up_layers + 1,  # +1 for initial token state
+                ego_traj_branches_fix_time=self.ego_traj_branches_fix_time
             )
 
         # Freeze all components except diffusion head when only finetuning diffusion

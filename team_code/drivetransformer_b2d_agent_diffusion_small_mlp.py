@@ -555,7 +555,43 @@ class DriveTransformerAgentDiffusion_Small_MLP(autonomous_agent.AutonomousAgent)
 
         # Ego trajectory mode selection (only 1 mode available for ego)
         selected_mode = 0
-        
+
+        # Truncate trajectory if displacement between consecutive points is too large
+        # This must happen BEFORE visualization code so graphs show truncated trajectory
+
+        # Debug: check model output (model outputs [left, forward] directly)
+        if self.step % 20 == 0:
+            model_output = output_data_batch[0]['ego_fut_preds_fix_time'][0,selected_mode,:,:].float().cpu().numpy()
+            print(f"[MODEL_OUTPUT] Step {self.step}: First 3 waypoints (model outputs [left, forward]):")
+            for i in range(min(3, len(model_output))):
+                print(f"  model_out[{i}]: left={model_output[i,0]:.3f}, forward={model_output[i,1]:.3f}")
+
+        ego_traj_fix_time_raw = output_data_batch[0]['ego_fut_preds_fix_time'][0,selected_mode,:,:].float().cpu().numpy()
+        max_displacement = 2.5  # Maximum allowed displacement in meters between consecutive waypoints
+        truncation_idx = len(ego_traj_fix_time_raw)
+        for i in range(1, len(ego_traj_fix_time_raw)):
+            displacement = np.linalg.norm(ego_traj_fix_time_raw[i] - ego_traj_fix_time_raw[i-1])
+            if displacement > max_displacement:
+                print(f"[TRAJ_TRUNCATION] Step {self.step}: Truncating trajectory at waypoint {i} (displacement={displacement:.2f}m > {max_displacement}m)")
+                truncation_idx = i
+                break
+
+        ego_traj_fix_time_truncated = ego_traj_fix_time_raw[:truncation_idx]
+
+        # Ensure we have at least 2 waypoints after truncation
+        if len(ego_traj_fix_time_truncated) < 2:
+            print(f"[TRAJ_TRUNCATION] Step {self.step}: WARNING - Trajectory too short after truncation, using minimal fallback")
+            ego_traj_fix_time_truncated = np.array([[0.0, 0.0], [0.5, 0.0]])
+
+        # Update output_data_batch so visualization shows truncated trajectory
+        # Model outputs [left, forward] - no swap needed
+        truncated_tensor = torch.from_numpy(ego_traj_fix_time_truncated).float().unsqueeze(0).unsqueeze(0)
+        output_data_batch[0]['ego_fut_preds_fix_time'] = truncated_tensor
+
+        # Store original trajectory and truncation index for visualization
+        output_data_batch[0]['ego_fut_preds_fix_time_original'] = torch.from_numpy(ego_traj_fix_time_raw).float().unsqueeze(0).unsqueeze(0)
+        output_data_batch[0]['truncation_idx'] = truncation_idx
+
         # Track agents in ego coordinates across frames
         # Pass current ego pose for storing with detections
         # Extract the actual numpy array from DataContainer if needed
@@ -568,7 +604,29 @@ class DriveTransformerAgentDiffusion_Small_MLP(autonomous_agent.AutonomousAgent)
         
         # Use raw (unsmoothed) ego pose for tracking to avoid lag
         self._update_agent_tracking(output_data_batch[0], current_ego_pose)
-        
+
+        # Compute control BEFORE visualization so we can display steering values
+        angles = output_data_batch[0]['ego_fut_preds_fix_dist'][0,selected_mode,:,0].float().cpu().numpy()
+        ego_traj_fix_dist = np.arange(1,21,dtype=np.float64).reshape(-1,1).repeat(2,1)
+        ego_traj_fix_dist[:,0] *= np.cos(angles)
+        ego_traj_fix_dist[:,1] *= np.sin(angles)
+        ego_traj_fix_time = output_data_batch[0]['ego_fut_preds_fix_time'][0,selected_mode,:,:].float().cpu().numpy()
+
+        if self.step <= 20:
+            steer, throttle, brake = 0.0, 0.0, 1.0
+        else:
+            # Debug: print first few waypoints to diagnose steering issue
+            if self.step % 20 == 0:
+                print(f"[CONTROL_DEBUG] Step {self.step}: First 5 waypoints (controller input [left, forward]):")
+                for i in range(min(5, len(ego_traj_fix_time))):
+                    print(f"  wp[{i}]: left={ego_traj_fix_time[i,0]:.3f}, forward={ego_traj_fix_time[i,1]:.3f}")
+
+            steer, throttle, brake, metadata = self.controller.control_pid(ego_traj_fix_time, tick_data['speed'], ego_traj_fix_time[-1])
+
+            # Debug: print steering value when it's high
+            if abs(steer) > 0.5 and self.step % 20 == 0:
+                print(f"[STEERING_DEBUG] Step {self.step}: High steering={steer:.3f}, first waypoint: [{ego_traj_fix_time[0,0]:.3f}, {ego_traj_fix_time[0,1]:.3f}]")
+
         # Visualize agent predictions with their best trajectory modes
         if 'agent_traj_cls_scores' in output_data_batch[0] and self.step % 10 == 0:
             # Get agent data
@@ -738,21 +796,38 @@ class DriveTransformerAgentDiffusion_Small_MLP(autonomous_agent.AutonomousAgent)
             # Plot ego predicted trajectories
             # Use the EXACT same processing as the save() method for BEV visualization
             if 'ego_fut_preds_fix_time' in output_data_batch[0] and 'ego_fut_preds_fix_dist' in output_data_batch[0]:
-                # Get raw trajectories from model (same as control code)
-                ego_traj_fix_time_raw = output_data_batch[0]['ego_fut_preds_fix_time'][0, selected_mode, :, [1, 0]].float().cpu().numpy()
-                angles = output_data_batch[0]['ego_fut_preds_fix_dist'][0, selected_mode, :, 0].float().cpu().numpy()
-                ego_traj_fix_dist_raw = np.arange(1, 21, dtype=np.float64).reshape(-1, 1).repeat(2, 1)
-                ego_traj_fix_dist_raw[:, 0] *= np.cos(angles)
-                ego_traj_fix_dist_raw[:, 1] *= np.sin(angles)
-                
-                # Process fix_time trajectory (same as save() method)
-                ego_fut_preds_fix_time_vis = ego_traj_fix_time_raw[:, [1, 0]]
-                ego_fut_preds_fix_time_vis = np.concatenate([ego_fut_preds_fix_time_vis, np.zeros((ego_fut_preds_fix_time_vis.shape[0], 1)), np.ones((ego_fut_preds_fix_time_vis.shape[0], 1))], axis=-1)
-                ego_fut_preds_fix_time_vis = np.dot(self.coor2topdown, ego_fut_preds_fix_time_vis.T).T
-                ego_fut_preds_fix_time_vis[:, :2] /= ego_fut_preds_fix_time_vis[:, 2:3]
-                ego_fut_preds_fix_time_vis = np.nan_to_num(ego_fut_preds_fix_time_vis)
-                ax_bev.plot(ego_fut_preds_fix_time_vis[:, 0], 512 - ego_fut_preds_fix_time_vis[:, 1], 'o-', color='red',
-                       linewidth=2.5, markersize=4, alpha=0.9, label='Ego Traj (Fixed Time)')
+                # Check if we have original trajectory and truncation info
+                if 'ego_fut_preds_fix_time_original' in output_data_batch[0] and 'truncation_idx' in output_data_batch[0]:
+                    # Get original (full) trajectory before truncation
+                    ego_traj_original = output_data_batch[0]['ego_fut_preds_fix_time_original'][0, selected_mode, :, [1, 0]].float().cpu().numpy()
+                    truncation_idx = output_data_batch[0]['truncation_idx']
+
+                    # Process full original trajectory
+                    ego_traj_vis_full = ego_traj_original[:, [1, 0]]
+                    ego_traj_vis_full = np.concatenate([ego_traj_vis_full, np.zeros((ego_traj_vis_full.shape[0], 1)), np.ones((ego_traj_vis_full.shape[0], 1))], axis=-1)
+                    ego_traj_vis_full = np.dot(self.coor2topdown, ego_traj_vis_full.T).T
+                    ego_traj_vis_full[:, :2] /= ego_traj_vis_full[:, 2:3]
+                    ego_traj_vis_full = np.nan_to_num(ego_traj_vis_full)
+
+                    # Plot kept portion (before truncation) in green
+                    if truncation_idx > 0:
+                        ax_bev.plot(ego_traj_vis_full[:truncation_idx, 0], 512 - ego_traj_vis_full[:truncation_idx, 1],
+                                   'o-', color='lime', linewidth=2.5, markersize=4, alpha=0.9, label='Ego Traj (Kept)')
+
+                    # Plot truncated portion in red with different style
+                    if truncation_idx < len(ego_traj_vis_full):
+                        ax_bev.plot(ego_traj_vis_full[truncation_idx-1:, 0], 512 - ego_traj_vis_full[truncation_idx-1:, 1],
+                                   'x--', color='red', linewidth=2.0, markersize=6, alpha=0.7, label='Ego Traj (Truncated)')
+                else:
+                    # Fallback: just plot the trajectory as before (shouldn't happen)
+                    ego_traj_fix_time_raw = output_data_batch[0]['ego_fut_preds_fix_time'][0, selected_mode, :, [1, 0]].float().cpu().numpy()
+                    ego_fut_preds_fix_time_vis = ego_traj_fix_time_raw[:, [1, 0]]
+                    ego_fut_preds_fix_time_vis = np.concatenate([ego_fut_preds_fix_time_vis, np.zeros((ego_fut_preds_fix_time_vis.shape[0], 1)), np.ones((ego_fut_preds_fix_time_vis.shape[0], 1))], axis=-1)
+                    ego_fut_preds_fix_time_vis = np.dot(self.coor2topdown, ego_fut_preds_fix_time_vis.T).T
+                    ego_fut_preds_fix_time_vis[:, :2] /= ego_fut_preds_fix_time_vis[:, 2:3]
+                    ego_fut_preds_fix_time_vis = np.nan_to_num(ego_fut_preds_fix_time_vis)
+                    ax_bev.plot(ego_fut_preds_fix_time_vis[:, 0], 512 - ego_fut_preds_fix_time_vis[:, 1], 'o-', color='red',
+                           linewidth=2.5, markersize=4, alpha=0.9, label='Ego Traj (Fixed Time)')
 
                 # Process fix_dist trajectory (same as save() method)
                 # ego_fut_preds_fix_dist_vis = ego_traj_fix_dist_raw[:, [1, 0]]
@@ -765,6 +840,21 @@ class DriveTransformerAgentDiffusion_Small_MLP(autonomous_agent.AutonomousAgent)
 
             ax_bev.legend(loc='upper right', fontsize=10, facecolor='black', edgecolor='white', labelcolor='white')
 
+            # Add control commands text
+            steer_text = f"Steer: {float(steer):.3f}"
+            throttle_text = f"Throttle: {float(throttle):.3f}"
+            brake_text = f"Brake: {float(brake):.3f}"
+            speed_text = f"Speed: {tick_data['speed']:.2f} m/s"
+
+            ax_bev.text(10, 540, steer_text, fontsize=12, color='yellow', weight='bold',
+                       bbox=dict(boxstyle='round', facecolor='black', alpha=0.8, edgecolor='yellow', linewidth=2))
+            ax_bev.text(10, 515, throttle_text, fontsize=12, color='lime', weight='bold',
+                       bbox=dict(boxstyle='round', facecolor='black', alpha=0.8, edgecolor='lime', linewidth=2))
+            ax_bev.text(10, 490, brake_text, fontsize=12, color='red', weight='bold',
+                       bbox=dict(boxstyle='round', facecolor='black', alpha=0.8, edgecolor='red', linewidth=2))
+            ax_bev.text(10, 465, speed_text, fontsize=12, color='cyan', weight='bold',
+                       bbox=dict(boxstyle='round', facecolor='black', alpha=0.8, edgecolor='cyan', linewidth=2))
+
             # Save combined visualization
             plt.tight_layout()
             plt.savefig(self.save_path / 'combined' / ('%04d.png' % self.step), dpi=100, bbox_inches='tight', facecolor='black')
@@ -775,23 +865,7 @@ class DriveTransformerAgentDiffusion_Small_MLP(autonomous_agent.AutonomousAgent)
         if len(self.step_time_avg)==20:
             # print("Model Avg Step Time:", np.mean(self.step_time_avg))
             self.step_time_avg.pop(0)
-        all_out_truck = None
-        ego_traj_cls_scores = None
-        angles = output_data_batch[0]['ego_fut_preds_fix_dist'][0,selected_mode,:,0].float().cpu().numpy()
-        # for trajectories with fixed distance, the output is the angle with y-axis in lidar coordinate system. 
-        # get the x, y coordinate with the disance and angle.
-        ego_traj_fix_dist = np.arange(1,21,dtype=np.float64).reshape(-1,1).repeat(2,1) 
-        ego_traj_fix_dist[:,0] *= np.cos(angles)
-        ego_traj_fix_dist[:,1] *= np.sin(angles)
-        ego_traj_fix_time = output_data_batch[0]['ego_fut_preds_fix_time'][0,selected_mode,:,[1,0]].float().cpu().numpy() 
-        if self.step <= 20: # waiting for scenerio initialization (cars are more likely to disappear suddenly in this period)
-            steer, throttle, brake = 0.0, 0.0, 1.0
-        else:
-            # steer, throttle, brake = self.controller.step(ego_traj_fix_time, ego_traj_fix_dist, tick_data['speed']) # PID controller
-            # Pure Pursuit controller: truncate trajectory to first 10 waypoints
-            truncated_traj = ego_traj_fix_time[:10]
-            steer, throttle, brake, metadata = self.controller.control_pid(truncated_traj, tick_data['speed'], truncated_traj[-1])
-
+        # Control was already computed above before visualization (lines 602-612)
         control = carla.VehicleControl(steer=float(steer), throttle=float(throttle), brake=float(brake))
         self.pid_metadata['steer'] = control.steer
         self.pid_metadata['throttle'] = control.throttle
