@@ -48,9 +48,9 @@ class DriveTransformerAgentDiffusion_Small_MLP(autonomous_agent.AutonomousAgent)
     def setup(self, path_to_conf_file):
         self.track = autonomous_agent.Track.SENSORS
         # self.controller = DecouplePIDController(speed_k_p=2.0, speed_k_i=0.8, speed_k_d=1.5, steer_k_p=1.5, steer_k_i=0.2, steer_k_d=0.2)
-        self.controller = PurePursuitController(lookahead_distance=4.0, wheelbase=2.89, max_throttle=0.75,
-                                                brake_speed=0.4, brake_ratio=1.0, speed_KP=5.0, speed_KI=0.5,
-                                                speed_KD=1.0, speed_n=40, clip_delta=0.25)
+        self.controller = PurePursuitController(lookahead_distance=4.0, wheelbase=2.89, max_throttle=1.0,
+                                                brake_speed=0.2, brake_ratio=0.8, speed_KP=5.0, speed_KI=0.5,
+                                                speed_KD=1.0, speed_n=20, clip_delta=0.25, dt=0.2)
         self.config_path = path_to_conf_file.split('+')[0]
         self.ckpt_path = path_to_conf_file.split('+')[1]
         if IS_BENCH2DRIVE:

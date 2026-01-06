@@ -27,13 +27,13 @@ class PID(object):
 		return self._K_P * error + self._K_I * integral + self._K_D * derivative
 
 class PurePursuitController(object):
-    
-    def __init__(self, lookahead_distance=4.0, wheelbase=2.89, max_throttle=0.75, 
-                 brake_speed=0.4, brake_ratio=1.0, speed_KP=5.0, speed_KI=0.5, 
-                 speed_KD=1.0, speed_n=40, clip_delta=0.25):
+
+    def __init__(self, lookahead_distance=4.0, wheelbase=2.89, max_throttle=0.75,
+                 brake_speed=0.4, brake_ratio=1.0, speed_KP=5.0, speed_KI=0.5,
+                 speed_KD=1.0, speed_n=40, clip_delta=0.25, dt=0.2):
         """
         Pure Pursuit controller for path following.
-        
+
         Args:
             lookahead_distance: Distance ahead to look for target point
             wheelbase: Vehicle wheelbase length in meters (for steering calculation)
@@ -42,6 +42,7 @@ class PurePursuitController(object):
             brake_ratio: Ratio for braking condition
             speed_KP, speed_KI, speed_KD, speed_n: PID parameters for speed control
             clip_delta: Maximum delta for speed control
+            dt: Time interval between waypoints in seconds (default 0.2s for DriveTransformer)
         """
         self.lookahead_distance = lookahead_distance
         self.wheelbase = wheelbase
@@ -49,7 +50,8 @@ class PurePursuitController(object):
         self.brake_speed = brake_speed
         self.brake_ratio = brake_ratio
         self.clip_delta = clip_delta
-        
+        self.dt = dt
+
         # Speed controller uses PID
         self.speed_controller = PID(K_P=speed_KP, K_I=speed_KI, K_D=speed_KD, n=speed_n)
     
@@ -67,11 +69,12 @@ class PurePursuitController(object):
             steer, throttle, brake, metadata
         """
         # Calculate desired speed from waypoints
+        # Speed = distance / time, where time interval between waypoints is self.dt
         num_pairs = len(waypoints) - 1
         desired_speed = 0
         for i in range(num_pairs):
             desired_speed += np.linalg.norm(
-                waypoints[i+1] - waypoints[i]) * 2.0 / num_pairs
+                waypoints[i+1] - waypoints[i]) / self.dt / num_pairs
         
         # Find lookahead point using Pure Pursuit algorithm
         lookahead_point = None
