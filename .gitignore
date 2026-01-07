@@ -161,3 +161,4 @@ val/
 .vscode
 
 debug_clean_traj_json.json
+.vscode

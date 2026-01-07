@@ -2322,6 +2322,8 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
                                      num_inference_steps=50,
                                      eta=0.0,
                                      clip_denoised=False,
+                                     initial_noise=None,
+                                     start_timestep_idx=0,
                                      device=None):
         """
         Generate trajectory samples from pure Gaussian noise using DDIM sampling.
@@ -2329,8 +2331,8 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         This implements the complete reverse diffusion process: noise -> clean trajectory.
 
         Process:
-        1. Start with pure Gaussian noise [B, num_traj_tokens * 2]
-        2. For each timestep t from T to 0:
+        1. Start with pure Gaussian noise [B, num_traj_tokens * 2] (or use initial_noise if provided)
+        2. For each timestep t from T (or start_timestep_idx) to 0:
            a. Tokenize the noisy trajectory with timestep embedding
            b. Use diffusion_head to predict noise using ego tokens
            c. Accumulate predictions from all layers (iterative refinement)
@@ -2342,10 +2344,12 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
                        Each should be [B, D]. Example:
                        [ego_token_layer0, ego_token_layer1, ..., ego_token_layerN]
                        Can also be a single tensor [L, B, D] where L is the number of layers.
-            batch_size: Number of trajectories to generate
+            batch_size: Number of trajectories to generate (ignored if initial_noise is provided)
             num_inference_steps: Number of denoising steps (fewer = faster, lower quality)
             eta: DDIM stochasticity (0.0 = deterministic, 1.0 = stochastic like DDPM)
             clip_denoised: Whether to clip predicted clean trajectories to [-1, 1]
+            initial_noise: Optional initial noisy state [B, num_traj_tokens * 2]. If None, starts from pure noise.
+            start_timestep_idx: Index in the timestep schedule to start denoising from (default 0 = start from max noise)
             device: Device to generate on (defaults to diffusion_scheduler device)
 
         Returns:
@@ -2368,6 +2372,16 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         else:
             raise ValueError("ego_tokens must be a tensor [L, B, D] or a list/tuple of [B, D]")
 
+        # Use initial_noise if provided, otherwise create from scratch
+        if initial_noise is not None:
+            x = initial_noise
+            batch_size = x.shape[0]
+            assert x.shape[1] == self.diffusion_num_traj_tokens * 2, \
+                f"initial_noise shape {x.shape} doesn't match expected [{batch_size}, {self.diffusion_num_traj_tokens * 2}]"
+        else:
+            # Start from pure Gaussian noise [B, num_traj_tokens * 2]
+            x = torch.randn(batch_size, self.diffusion_num_traj_tokens * 2, device=device)
+
         # Validate each ego token
         for i, ego_token in enumerate(ego_tokens_list):
             if ego_token.dim() != 2:
@@ -2377,9 +2391,6 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             if ego_token.shape[1] != self.embed_dims:
                 raise ValueError(f"ego_token {i} dim {ego_token.shape[1]} != expected {self.embed_dims}")
 
-        # Start from pure Gaussian noise [B, num_traj_tokens * 2]
-        x = torch.randn(batch_size, self.diffusion_num_traj_tokens * 2, device=device)
-
         # Create timestep schedule for DDIM (uniform spacing for faster inference)
         total_timesteps = self.diffusion_num_timesteps
         if num_inference_steps >= total_timesteps:
@@ -2387,6 +2398,9 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         else:
             step_size = total_timesteps // num_inference_steps
             timesteps = list(reversed(range(0, total_timesteps, step_size)))
+
+        # Only denoise from start_timestep_idx onwards
+        timesteps = timesteps[start_timestep_idx:]
 
         # Define denoising function for the scheduler
         def denoise_fn(x_t, t, context=None):
@@ -2436,7 +2450,229 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             )
 
         return x
-    
+
+    @torch.no_grad()
+    def sample_trajectory_diffusion_es(self,
+                                       ego_tokens,
+                                       reward_fn,
+                                       batch_size=1,
+                                       num_iterations=50,
+                                       num_inference_steps=50,
+                                       num_particles=128,
+                                       top_k=32,
+                                       renoise_ratio=0.5,
+                                       eta=0.0,
+                                       clip_denoised=False,
+                                       device=None):
+        """
+        Generate trajectory samples using Diffusion-ES (Evolution Strategies) with reward guidance.
+
+        This implements an iterative refine-and-select approach:
+        1. Start with num_particles random trajectories
+        2. For num_iterations iterations:
+           a. Evaluate all particles using the reward function
+           b. Select top-k particles with highest rewards
+           c. Renoise top-k particles by renoise_ratio (e.g., 25% through denoising)
+           d. Denoise them back using sample_trajectory_from_noise
+           e. Expand back to num_particles population and repeat
+
+        Args:
+            ego_tokens: List of ego token tensors, one per decoder layer.
+                       Each should be [B, D]. Can also be a single tensor [L, B, D].
+            reward_fn: Callable that takes unnormalized trajectories [B*num_particles, num_traj_tokens*2] and
+                      returns rewards [B*num_particles]. Higher rewards are better.
+                      Trajectories passed to reward_fn are in unnormalized absolute coordinates.
+            batch_size: Number of independent ES runs (typically 1)
+            num_iterations: Number of renoise-denoise-select iterations
+            num_inference_steps: Number of steps in DDIM schedule for denoising
+            num_particles: Number of particles in the ES population (e.g., 128)
+            top_k: Number of top particles to select based on rewards (e.g., 32)
+            renoise_ratio: Fraction through the denoising schedule to renoise.
+                          0.0 = renoise to pure noise (timestep 1000)
+                          0.25 = renoise to 25% through denoising (timestep ~750, still 75% noise)
+                          0.5 = renoise to halfway (timestep ~500, 50% noise)
+                          0.75 = renoise to 75% through denoising (timestep ~250, 25% noise)
+                          Higher values = less noise added, more of original trajectory preserved
+            eta: DDIM stochasticity parameter
+            clip_denoised: Whether to clip denoised trajectories
+            device: Device to generate on
+
+        Returns:
+            dict with keys:
+                'best_trajectory': Best generated trajectory [B, num_traj_tokens, 2] in unnormalized absolute coordinates
+                'initial_population': Initial population [B, num_particles, num_traj_tokens, 2] in unnormalized coordinates
+                'iterations': List of dicts, one per iteration, each containing:
+                    'top_k_trajectories': Top-k trajectories [B, top_k, num_traj_tokens, 2] in unnormalized coordinates
+                    'rewards': Rewards for all particles [B, num_particles]
+        """
+        if not self.use_diffusion_loss:
+            raise RuntimeError("Diffusion not enabled. Set use_diffusion_loss=True in config.")
+
+        if device is None:
+            device = self.diffusion_scheduler.betas.device
+
+        # Validate and normalize ego_tokens
+        if isinstance(ego_tokens, torch.Tensor):
+            assert ego_tokens.dim() == 3, f"ego_tokens tensor must be 3D [L, B, D], got {ego_tokens.shape}"
+            ego_tokens_list = [ego_tokens[i] for i in range(ego_tokens.shape[0])]
+        elif isinstance(ego_tokens, (list, tuple)):
+            ego_tokens_list = ego_tokens
+        else:
+            raise ValueError("ego_tokens must be a tensor [L, B, D] or a list/tuple of [B, D]")
+
+        # Validate each ego token
+        for i, ego_token in enumerate(ego_tokens_list):
+            if ego_token.dim() != 2:
+                raise ValueError(f"ego_token {i} must be 2D [B, D], got {ego_token.shape}")
+            if ego_token.shape[0] != batch_size:
+                raise ValueError(f"ego_token {i} batch size {ego_token.shape[0]} != requested {batch_size}")
+            if ego_token.shape[1] != self.embed_dims:
+                raise ValueError(f"ego_token {i} dim {ego_token.shape[1]} != expected {self.embed_dims}")
+
+        assert top_k <= num_particles, f"top_k ({top_k}) must be <= num_particles ({num_particles})"
+        assert num_particles % top_k == 0, f"num_particles ({num_particles}) must be divisible by top_k ({top_k})"
+
+
+        # 4. Denoise using sample_trajectory_from_noise starting from renoise_idx
+        # Expand ego_tokens to batch_size * top_k
+        ego_tokens_top_k = [
+            ego_token.unsqueeze(1).expand(-1, top_k, -1).reshape(batch_size * top_k, -1)
+            for ego_token in ego_tokens_list
+        ]
+
+        ego_tokens_num_particles = [
+            ego_token.unsqueeze(1).expand(-1, num_particles, -1).reshape(batch_size * num_particles, -1)
+            for ego_token in ego_tokens_list
+        ]
+
+        traj_dim = self.diffusion_num_traj_tokens * 2
+        # Initialize population with pure noise: [B, num_particles, traj_dim]
+        x_denoised = self.sample_trajectory_from_noise(
+            ego_tokens=ego_tokens_num_particles,
+            batch_size=batch_size * num_particles,
+            num_inference_steps=num_inference_steps,
+            eta=eta,
+            device=device
+        )
+
+        # Reshape to [B, num_particles, traj_dim] for gather operations
+        x = x_denoised.reshape(batch_size, num_particles, traj_dim)
+
+        # Store initial population (unnormalized)
+        initial_population_unnormalized = self.diffusion_head.unnormalize_trajectory(
+            x_denoised.reshape(batch_size * num_particles, traj_dim)
+        )  # [B*num_particles, num_traj_tokens, 2]
+        initial_population_unnormalized = initial_population_unnormalized.reshape(
+            batch_size, num_particles, self.diffusion_num_traj_tokens, 2
+        )
+
+        # Storage for iteration data
+        iterations_data = []
+
+        # Create DDIM timestep schedule
+        # full_timesteps goes from high noise to low noise: [1000, 950, ..., 50, 0]
+        total_timesteps = self.diffusion_num_timesteps
+        if num_inference_steps >= total_timesteps:
+            full_timesteps = list(reversed(range(total_timesteps)))
+        else:
+            step_size = total_timesteps // num_inference_steps
+            full_timesteps = list(reversed(range(0, total_timesteps, step_size)))
+
+        # Calculate renoise index: renoise_ratio=0.25 means 25% through the denoising process
+        # This is index 25% into the timestep schedule
+        renoise_idx = int(len(full_timesteps) * renoise_ratio)
+        renoise_idx = min(renoise_idx, len(full_timesteps) - 1)
+        renoise_t_val = full_timesteps[renoise_idx]
+
+        # Iterative refine-and-select loop
+        for iteration in range(num_iterations):
+            # 1. Evaluate all particles using reward function
+            x_flat = x.reshape(batch_size * num_particles, traj_dim)
+            # Unnormalize trajectories before passing to reward function
+            x_flat_unnormalized = self.diffusion_head.unnormalize_trajectory(x_flat)  # [B*num_particles, num_traj_tokens, 2]
+            # Flatten back to [B*num_particles, num_traj_tokens * 2]
+            x_flat_unnormalized = x_flat_unnormalized.reshape(batch_size * num_particles, -1)
+            rewards = reward_fn(x_flat_unnormalized)  # [B*num_particles]
+            if not isinstance(rewards, torch.Tensor):
+                rewards = torch.tensor(rewards, device=device, dtype=torch.float32)
+            assert rewards.shape == (batch_size * num_particles,), \
+                f"reward_fn should return [{batch_size * num_particles}], got {rewards.shape}"
+
+            # Reshape rewards: [B, num_particles]
+            rewards = rewards.reshape(batch_size, num_particles)
+
+            # 2. Select top-k particles per batch based on rewards
+            top_k_indices = torch.topk(rewards, top_k, dim=1).indices  # [B, top_k]
+
+            # Gather top-k particles: [B, top_k, traj_dim]
+            top_k_particles = torch.gather(
+                x, 1,
+                top_k_indices.unsqueeze(-1).expand(-1, -1, traj_dim)
+            )
+
+            # Store top-k trajectories (unnormalized) for this iteration
+            top_k_unnormalized = self.diffusion_head.unnormalize_trajectory(
+                top_k_particles.reshape(batch_size * top_k, traj_dim)
+            )  # [B*top_k, num_traj_tokens, 2]
+            top_k_unnormalized = top_k_unnormalized.reshape(
+                batch_size, top_k, self.diffusion_num_traj_tokens, 2
+            )
+
+            iterations_data.append({
+                'top_k_trajectories': top_k_unnormalized.cpu(),
+                'rewards': rewards.cpu(),
+                'population': x_flat_unnormalized.cpu().reshape(batch_size, num_particles, self.diffusion_num_traj_tokens, 2)
+            })
+
+            # 3. Expand top-k particles to num_particles BEFORE renoising
+            # This ensures each clone gets different noise, creating diversity
+            repeats_per_particle = num_particles // top_k
+            top_k_expanded = top_k_particles.repeat_interleave(repeats_per_particle, dim=1)  # [B, num_particles, traj_dim]
+
+            # 4. Renoise all particles using q_sample to renoise_t_val
+            top_k_expanded_flat = top_k_expanded.reshape(batch_size * num_particles, traj_dim)
+            t_renoise = torch.full((batch_size * num_particles,), renoise_t_val, device=device, dtype=torch.long)
+            x_renoised, _ = self.diffusion_scheduler.q_sample(top_k_expanded_flat, t_renoise)
+
+            # 5. Denoise from renoise_idx to end of schedule
+            x_denoised = self.sample_trajectory_from_noise(
+                ego_tokens=ego_tokens_num_particles,
+                batch_size=batch_size * num_particles,
+                num_inference_steps=num_inference_steps,
+                eta=eta,
+                clip_denoised=clip_denoised,
+                initial_noise=x_renoised,
+                start_timestep_idx=renoise_idx,
+                device=device
+            )
+
+            # Reshape: [B, num_particles, traj_dim]
+            x = x_denoised.reshape(batch_size, num_particles, traj_dim)
+
+        # Final evaluation to select best trajectory
+        x_flat = x.reshape(batch_size * num_particles, traj_dim)
+        # Unnormalize before final reward evaluation
+        x_flat_unnormalized = self.diffusion_head.unnormalize_trajectory(x_flat)  # [B*num_particles, num_traj_tokens, 2]
+        x_flat_unnormalized = x_flat_unnormalized.reshape(batch_size * num_particles, -1)
+        final_rewards = reward_fn(x_flat_unnormalized)
+        if not isinstance(final_rewards, torch.Tensor):
+            final_rewards = torch.tensor(final_rewards, device=device, dtype=torch.float32)
+        final_rewards = final_rewards.reshape(batch_size, num_particles)
+        best_indices = torch.argmax(final_rewards, dim=1)
+
+        # Gather best trajectories (in normalized space)
+        best_trajectories = x[torch.arange(batch_size, device=device), best_indices]
+
+        # Unnormalize the best trajectories before returning
+        best_trajectories_unnormalized = self.diffusion_head.unnormalize_trajectory(best_trajectories)
+
+        # Return dictionary with all collected data
+        return {
+            'best_trajectory': best_trajectories_unnormalized.cpu(),
+            'initial_population': initial_population_unnormalized.cpu(),
+            'iterations': iterations_data
+        }
+
     def loss_single(self,
                     cls_scores,
                     bbox_preds,

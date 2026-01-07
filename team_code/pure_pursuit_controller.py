@@ -96,8 +96,8 @@ class PurePursuitController(object):
         
         # Pure Pursuit steering calculation
         # Convert lookahead point to vehicle frame (y forward, x right)
-        x = lookahead_point[0]  # right
-        y = lookahead_point[1]  # forward
+        x = lookahead_point[0]  # forward
+        y = lookahead_point[1]  # left
         
         # Calculate lookahead distance (L)
         L = np.linalg.norm(lookahead_point)
