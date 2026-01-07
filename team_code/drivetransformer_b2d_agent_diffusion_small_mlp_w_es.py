@@ -331,7 +331,13 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
 
 
         # determine if we should save the data
-        self.should_save_data = random.random() < 0.2
+        # self.should_save_data = random.random() < 0.4
+        self.should_save_data = True
+
+        # diffusion-es replanning frequency control
+        self.replan_every_n_steps = 10  # Replan every N steps
+        self.last_replan_step = -1  # Track when we last replanned
+        self.cached_trajectory = None  # Cache the planned trajectory
   
     def sensors(self):
         sensors = []
@@ -622,51 +628,65 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             rewards_tensor = torch.from_numpy(rewards).to(trajectories.device)
             return rewards_tensor
 
-        # Sample trajectory using diffusion-es with reward guidance
-        # Note: sample_trajectory_diffusion_es now returns a dict with unnormalized trajectories
-        start_time = time.time()
-        diffusion_es_outputs = self.model.pts_bbox_head.sample_trajectory_diffusion_es(
-            ego_tokens=ego_tokens,
-            reward_fn=reward_fn,
-            batch_size=batch_size,
-            num_iterations=5,  # Number of refine-and-select iterations
-            num_inference_steps=50,  # Denoising steps per iteration
-            num_particles=128,  # Population size
-            top_k=32,  # Select top 32 particles each iteration
-            renoise_ratio=0.8,  # Renoise to 80% through denoising
-            eta=1.0,  # Non-Deterministic sampling
-            clip_denoised=False,
-            device=intermediate_ego_query.device
-        )
-        end_time = time.time()
-        print(f"Diffusion-ES sampling completed in {end_time - start_time:.2} seconds.", flush=True)
+        # Check if we need to replan or can reuse cached trajectory
+        steps_since_last_replan = self.step - self.last_replan_step
+        should_replan = (self.cached_trajectory is None or
+                        steps_since_last_replan >= self.replan_every_n_steps)
 
-        # Extract best trajectory from diffusion output
-        # best_trajectory is on CPU as [B, num_traj_tokens, 2], we need to extract batch 0
-        sampled_traj_absolute = diffusion_es_outputs['best_trajectory'][0]  # [num_traj_tokens, 2]
+        if should_replan:
+            # Sample trajectory using diffusion-es with reward guidance
+            # Note: sample_trajectory_diffusion_es now returns a dict with unnormalized trajectories
+            start_time = time.time()
+            diffusion_es_outputs = self.model.pts_bbox_head.sample_trajectory_diffusion_es(
+                ego_tokens=ego_tokens,
+                reward_fn=reward_fn,
+                batch_size=batch_size,
+                num_iterations=3,  # Number of refine-and-select iterations
+                num_inference_steps=50,  # Denoising steps per iteration
+                num_particles=32,  # Population size
+                top_k=8,  # Select top 8 particles each iteration
+                renoise_ratio=0.8,  # Renoise to 80% through denoising
+                eta=1.0,  # Non-Deterministic sampling
+                clip_denoised=False,
+                device=intermediate_ego_query.device
+            )
+            end_time = time.time()
+            print(f"Diffusion-ES sampling completed in {end_time - start_time:.2} seconds.", flush=True)
 
-        # Convert to numpy if it's a tensor
-        if isinstance(sampled_traj_absolute, torch.Tensor):
-            sampled_traj_absolute_np = sampled_traj_absolute.numpy()
+            # Extract best trajectory from diffusion output
+            # best_trajectory is on CPU as [B, num_traj_tokens, 2], we need to extract batch 0
+            sampled_traj_absolute = diffusion_es_outputs['best_trajectory'][0]  # [num_traj_tokens, 2]
+
+            # Convert to numpy if it's a tensor
+            if isinstance(sampled_traj_absolute, torch.Tensor):
+                sampled_traj_absolute_np = sampled_traj_absolute.numpy()
+            else:
+                sampled_traj_absolute_np = sampled_traj_absolute
+
+            # Calculate truncation index based on displacement threshold
+            truncation_idx = len(sampled_traj_absolute_np)  # Default: use full trajectory
+            max_displacement = 5.0  # meters - max allowed displacement between consecutive waypoints
+
+            for i in range(1, len(sampled_traj_absolute_np)):
+                displacement = np.linalg.norm(sampled_traj_absolute_np[i] - sampled_traj_absolute_np[i-1])
+                if displacement > max_displacement:
+                    truncation_idx = i
+                    break
+
+            # Truncate trajectory if displacement between consecutive points is too large
+            ego_traj_fix_time_truncated = sampled_traj_absolute_np[:truncation_idx]
+
+            # Ensure we have at least 2 waypoints after truncation
+            if len(ego_traj_fix_time_truncated) < 2:
+                ego_traj_fix_time_truncated = np.array([[0.0, 0.0], [0.5, 0.0]])
+
+            # Cache the trajectory and update replan step
+            self.cached_trajectory = ego_traj_fix_time_truncated.copy()
+            self.last_replan_step = self.step
         else:
-            sampled_traj_absolute_np = sampled_traj_absolute
-
-        # Calculate truncation index based on displacement threshold
-        truncation_idx = len(sampled_traj_absolute_np)  # Default: use full trajectory
-        max_displacement = 5.0  # meters - max allowed displacement between consecutive waypoints
-
-        for i in range(1, len(sampled_traj_absolute_np)):
-            displacement = np.linalg.norm(sampled_traj_absolute_np[i] - sampled_traj_absolute_np[i-1])
-            if displacement > max_displacement:
-                truncation_idx = i
-                break
-
-        # Truncate trajectory if displacement between consecutive points is too large
-        ego_traj_fix_time_truncated = sampled_traj_absolute_np[:truncation_idx]
-
-        # Ensure we have at least 2 waypoints after truncation
-        if len(ego_traj_fix_time_truncated) < 2:
-            ego_traj_fix_time_truncated = np.array([[0.0, 0.0], [0.5, 0.0]])
+            # Reuse cached trajectory
+            ego_traj_fix_time_truncated = self.cached_trajectory
+            print(f"Reusing cached trajectory (step {steps_since_last_replan}/{self.replan_every_n_steps})", flush=True)
 
         # Update output_data_batch so visualization shows truncated trajectory
         # Model outputs [left, forward] - no swap needed
@@ -980,9 +1000,9 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         print(f"Drivable area map computed in {end_time-start_time:.2f} seconds.", flush=True)  
 
         if draw_traj and diffusion_es_outputs is not None:
-            # Determine number of subplots: BEV + Best Trajectory + 1 per iteration
+            # Determine number of subplots: Front Image + BEV + Best Trajectory + 1 per iteration
             num_iterations = len(diffusion_es_outputs.get('iterations', []))
-            num_subplots = 4 + num_iterations  # BEV, Best Trajectory, + iterations + one for drivable area
+            num_subplots = 4 + num_iterations  # Front Image, BEV, Best Trajectory, + iterations + one for drivable area
 
             # Arrange in grid: calculate rows and columns
             # Aim for roughly square grid, prefer more columns than rows
@@ -998,6 +1018,13 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 axes[idx].axis('off')
 
             ax_idx = 0
+
+            # Subplot 0: Front camera image
+            front_img = tick_data['imgs']['CAM_FRONT']
+            axes[ax_idx].imshow(cv2.cvtColor(front_img, cv2.COLOR_BGR2RGB))
+            axes[ax_idx].set_title(f'Front Camera - Step {self.step}')
+            axes[ax_idx].axis('off')
+            ax_idx += 1
 
             # Subplot 1: BEV image only
             axes[ax_idx].imshow(bev_frame)
@@ -1104,12 +1131,12 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                     population = iteration_data['population'][0]  # [num_particles, num_traj_tokens, 2]
                     if isinstance(population, torch.Tensor):
                         population = population.cpu().numpy()
-                    # Plot all particles from previous iteration (gray)
+                    # Plot all particles from previous iteration (yellow/gold)
                     # For first iteration, use initial population
                     if population is not None:
                         for i in range(population.shape[0]):
                             ax.plot(population[i, :, 0], population[i, :, 1],
-                                   'gray', linewidth=0.5, alpha=0.6, zorder=1)
+                                   'gold', linewidth=0.5, alpha=0.5, zorder=1)
 
                     # Plot top-k selected trajectories (blue/green)
                     top_k_trajs = iteration_data['top_k_trajectories'][0]  # [top_k, num_traj_tokens, 2]
