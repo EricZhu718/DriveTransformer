@@ -31,7 +31,7 @@ from torch.cuda.amp import autocast
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, Polygon
 
 IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
 
@@ -676,20 +676,81 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
 
         return pixels
 
+    def _rect_corners(self, center, length, width, yaw):
+        """
+        Return 4 corner points of an oriented rectangle centered at `center`.
+
+        Args:
+            center: (2,) numpy array - center position in ego frame [left, forward]
+            length: float - length of rectangle (along forward direction)
+            width: float - width of rectangle (along left direction)
+            yaw: float - rotation angle in radians
+
+        Returns:
+            (4, 2) numpy array of corner points in ego frame [left, forward]
+        """
+        hl = length / 2.0
+        hw = width / 2.0
+        # Local corners: forward-left coordinate system
+        local = np.array([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]])
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        R = np.array([[c, -s], [s, c]])
+        world_pts = (R @ local.T).T + center.reshape(1, 2)
+        return world_pts
+
+
+    def collision_and_drivable_area_reward(self, 
+                                        ego_trajectories, 
+                                        agent_bbx, 
+                                        agent_vel, 
+                                        drivable_map,
+                                        grid_resolution):
+        
+        # assume ego_trajectories: [B*num_particles, num_traj_tokens, 2] in unnormalized absolute coordinates
+        # assume agent_bbx is a list of length M, each element is (4, 2) numpy array of bbox corners in ego frame
+        # assume agent_vel is a list of length M, each element is (2,) numpy array of velocity in ego frame
+        # drivable_map: 2D numpy array, 1=drivable, 0=non-drivable
+        # grid_resolution: float, meters per pixel
+
+        # for x is right, y is forward in ego frame
+        # drivable map (0,0) is behind vehicle, to the left
+        # drivable_map[i, j] is col i, row j
+
+        # first need to shift ego trajectories to drivable map pixel coordinates
+        map_size = drivable_map.shape[0]
+        ego_trajectories_pixels = ego_trajectories_pixels / grid_resolution + map_size / 2.0
+        
+
+
     def save(self, tick_data, diffusion_es_outputs, draw_traj=False):
         frame = self.step // 10
 
         bev_frame = tick_data['bev'].copy()
 
+        # Get vehicle information for bounding box visualization
+        vehicles_info = self.get_vehicles_info()
+
+        # Get drivable area map from CARLA
+        drivable_area_info = self.get_drivable_area_map(grid_size=200, grid_resolution=0.2)
+
         if draw_traj and diffusion_es_outputs is not None:
             # Determine number of subplots: BEV + Best Trajectory + 1 per iteration
             num_iterations = len(diffusion_es_outputs.get('iterations', []))
-            num_subplots = 2 + num_iterations  # BEV, Best, + iterations
+            num_subplots = 2 + num_iterations  # BEV, Best Trajectory, + iterations
 
-            # Create figure with subplots in a row
-            fig, axes = plt.subplots(1, num_subplots, figsize=(10 * num_subplots, 10))
-            if num_subplots == 1:
-                axes = [axes]
+            # Arrange in grid: calculate rows and columns
+            # Aim for roughly square grid, prefer more columns than rows
+            num_cols = int(np.ceil(np.sqrt(num_subplots * 1.5)))  # 1.5 aspect ratio preference
+            num_rows = int(np.ceil(num_subplots / num_cols))
+
+            # Create figure with subplots in a grid
+            fig, axes = plt.subplots(num_rows, num_cols, figsize=(10 * num_cols, 10 * num_rows))
+            axes = axes.flatten() if num_subplots > 1 else [axes]
+
+            # Hide unused subplots
+            for idx in range(num_subplots, len(axes)):
+                axes[idx].axis('off')
 
             ax_idx = 0
 
@@ -699,7 +760,17 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             axes[ax_idx].axis('off')
             ax_idx += 1
 
-            # Subplot 2: Best trajectory
+            drivable_map = drivable_area_info['drivable_map']
+            grid_resolution = drivable_area_info['grid_resolution']
+            grid_size = drivable_map.shape[0]
+            map_extent = [
+                -grid_size * grid_resolution / 2,
+                grid_size * grid_resolution / 2,
+                -grid_size * grid_resolution / 2,
+                grid_size * grid_resolution / 2,
+            ]
+
+            # Subplot 2: Best trajectory with drivable area overlay
             best_traj = diffusion_es_outputs['best_trajectory'][0]  # [num_traj_tokens, 2]
 
             # Convert to numpy if needed
@@ -707,6 +778,21 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 best_traj_np = best_traj.cpu().numpy()
             else:
                 best_traj_np = best_traj
+
+            # Overlay drivable area map: 1=white (drivable), 0=black (non-drivable)
+            axes[ax_idx].imshow(
+                drivable_map.T,
+                origin='lower',
+                cmap='gray',
+                vmin=0.0,
+                vmax=1.0,
+                alpha=1.0,
+                extent=map_extent,
+                zorder=1
+            )
+
+            # set background color to black (outside map extent)
+            axes[ax_idx].set_facecolor('black')
 
             # Plot best trajectory in ego coordinates (forward, left)
             axes[ax_idx].plot(best_traj_np[:, 0], best_traj_np[:, 1],
@@ -716,11 +802,41 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             axes[ax_idx].plot(best_traj_np[-1, 0], best_traj_np[-1, 1],
                              'r*', markersize=15, label='End', zorder=5)
             axes[ax_idx].plot(0, 0, 'yo', markersize=12, label='Ego Vehicle', zorder=10)
+
+            # Draw ego vehicle bounding box
+            ego_bbox = self.hero_actor.bounding_box
+            ego_extent = ego_bbox.extent
+            ego_length = ego_extent.x * 2.0
+            ego_width = ego_extent.y * 2.0
+            ego_center = np.array([0.0, 0.0])  # Ego vehicle is at origin in ego frame
+            ego_corners = self._rect_corners(ego_center, ego_length, ego_width, np.pi/2)  # Add 90 deg rotation
+            ego_poly = Polygon(ego_corners, closed=True, facecolor='red', edgecolor='red',
+                              linewidth=2.0, alpha=0.6, zorder=15)
+            axes[ax_idx].add_patch(ego_poly)
+
+            # Draw vehicle bounding boxes using precomputed corners
+            for i in range(len(vehicles_info['vehicle_ids'])):
+                corners = vehicles_info['bbox_corners_ego'][i]
+                poly = Polygon(corners, closed=True, facecolor='cyan', edgecolor='cyan',
+                              linewidth=1.5, alpha=0.5)
+                axes[ax_idx].add_patch(poly)
+
+            # Draw velocity vectors for all vehicles
+            for i in range(len(vehicles_info['vehicle_ids'])):
+                ego_pos = vehicles_info['ego_positions'][i]
+                ego_vel = vehicles_info['ego_velocities'][i]
+                # Draw arrow from vehicle position in direction of velocity
+                axes[ax_idx].arrow(ego_pos[0], ego_pos[1], ego_vel[0], ego_vel[1],
+                                  head_width=0.5, head_length=0.5, fc='blue', ec='blue',
+                                  alpha=0.7, linewidth=2, zorder=20)
+
             axes[ax_idx].set_xlabel('Left (m)')
             axes[ax_idx].set_ylabel('Forward (m)')
             axes[ax_idx].set_title(f'Best Trajectory - Step {self.step}')
             axes[ax_idx].grid(True, alpha=0.3)
-            axes[ax_idx].axis('equal')
+            axes[ax_idx].set_xlim(-20, 20)
+            axes[ax_idx].set_ylim(-20, 20)
+            axes[ax_idx].set_aspect('equal', adjustable='box')
             axes[ax_idx].legend(loc='upper right')
             ax_idx += 1
 
@@ -728,6 +844,17 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             if 'iterations' in diffusion_es_outputs:
                 for iter_idx, iteration_data in enumerate(diffusion_es_outputs['iterations']):
                     ax = axes[ax_idx]
+                    ax.set_facecolor('black')
+                    ax.imshow(
+                        drivable_map.T,
+                        origin='lower',
+                        cmap='gray',
+                        vmin=0.0,
+                        vmax=1.0,
+                        alpha=1.0,
+                        extent=map_extent,
+                        zorder=0
+                    )
 
                     population = iteration_data['population'][0]  # [num_particles, num_traj_tokens, 2]
                     if isinstance(population, torch.Tensor):
@@ -758,11 +885,40 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                     # Mark ego vehicle
                     ax.plot(0, 0, 'yo', markersize=12, label='Ego Vehicle', zorder=100)
 
+                    # Draw ego vehicle bounding box
+                    ego_bbox = self.hero_actor.bounding_box
+                    ego_extent = ego_bbox.extent
+                    ego_length = ego_extent.x * 2.0
+                    ego_width = ego_extent.y * 2.0
+                    ego_center = np.array([0.0, 0.0])  # Ego vehicle is at origin in ego frame
+                    ego_corners = self._rect_corners(ego_center, ego_length, ego_width, np.pi/2)  # Add 90 deg rotation
+                    ego_poly = Polygon(ego_corners, closed=True, facecolor='red', edgecolor='red',
+                                      linewidth=2.0, alpha=0.6, zorder=15)
+                    ax.add_patch(ego_poly)
+
+                    # Draw vehicle bounding boxes using precomputed corners
+                    for i in range(len(vehicles_info['vehicle_ids'])):
+                        corners = vehicles_info['bbox_corners_ego'][i]
+                        poly = Polygon(corners, closed=True, facecolor='cyan', edgecolor='cyan',
+                                      linewidth=1.5, alpha=0.5)
+                        ax.add_patch(poly)
+
+                    # Draw velocity vectors for all vehicles
+                    for i in range(len(vehicles_info['vehicle_ids'])):
+                        ego_pos = vehicles_info['ego_positions'][i]
+                        ego_vel = vehicles_info['ego_velocities'][i]
+                        # Draw arrow from vehicle position in direction of velocity
+                        ax.arrow(ego_pos[0], ego_pos[1], ego_vel[0], ego_vel[1],
+                                head_width=0.5, head_length=0.5, fc='blue', ec='blue',
+                                alpha=0.7, linewidth=2, zorder=20)
+
                     ax.set_xlabel('Left (m)')
                     ax.set_ylabel('Forward (m)')
                     ax.set_title(f'Iteration {iter_idx + 1}')
                     ax.grid(True, alpha=0.3)
-                    ax.axis('equal')
+                    ax.set_xlim(-20, 20)
+                    ax.set_ylim(-20, 20)
+                    ax.set_aspect('equal', adjustable='box')
                     ax.legend(loc='upper right', fontsize=8)
 
                     ax_idx += 1
@@ -790,4 +946,237 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         y = scale * EARTH_RADIUS_EQUA * math.log(math.tan((90.0 + self.lat_ref) * math.pi / 360.0)) - my
         x = mx - scale * self.lon_ref * math.pi * EARTH_RADIUS_EQUA / 180.0
         return np.array([x, y])
-    
+
+    def get_vehicles_info(self):
+        """
+        Get information about all vehicles in the scene (excluding the ego vehicle).
+
+        Returns:
+            dict: {
+                'world_positions': numpy array of shape (num_vehicles, 3) - world coordinates (x, y, z)
+                'world_velocities': numpy array of shape (num_vehicles, 3) - world frame velocities (x, y, z)
+                'speeds': numpy array of shape (num_vehicles,) - speed in m/s
+                'yaws': numpy array of shape (num_vehicles,) - yaw angles in degrees
+                'pitches': numpy array of shape (num_vehicles,) - pitch angles in degrees
+                'rolls': numpy array of shape (num_vehicles,) - roll angles in degrees
+                'bbox_extents': numpy array of shape (num_vehicles, 3) - bounding box extents (x, y, z)
+                'vehicle_ids': list of carla.Actor IDs
+                'vehicle_types': list of vehicle type strings
+                'ego_positions': numpy array of shape (num_vehicles, 2) - positions in ego frame (x forward, y left)
+                'ego_velocities': numpy array of shape (num_vehicles, 2) - velocities in ego frame (x forward, y left)
+                'bbox_corners_ego': list of numpy arrays - each array is (4, 2) containing corner positions in ego frame
+            }
+        """
+        # Get ego vehicle transform to create transformation matrices
+        gt_transform = self.hero_actor.get_transform()
+        gt_x = gt_transform.location.x
+        gt_y = gt_transform.location.y
+        gt_theta_deg = gt_transform.rotation.yaw
+        gt_theta = -math.radians(gt_theta_deg) + np.pi/2
+
+        # Create ego to world and world to ego transformation matrices
+        ego_to_world = np.array([
+            [np.cos(-gt_theta), -np.sin(-gt_theta), gt_x],
+            [np.sin(-gt_theta), np.cos(-gt_theta), gt_y],
+            [0, 0, 1]
+        ])
+        world_to_ego = np.linalg.inv(ego_to_world)
+        rotation_matrix = world_to_ego[:2, :2]
+
+        # Get all vehicles in the world
+        world = self.hero_actor.get_world()
+        all_vehicles = world.get_actors().filter('vehicle.*')
+
+        # Initialize lists to collect vehicle data
+        world_positions = []
+        world_velocities = []
+        speeds = []
+        yaws = []
+        pitches = []
+        rolls = []
+        bbox_extents = []
+        vehicle_ids = []
+        vehicle_types = []
+        ego_positions = []
+        ego_velocities = []
+        bbox_corners_ego = []
+
+        for vehicle in all_vehicles:
+            # Skip the ego vehicle itself
+            if vehicle.id == self.hero_actor.id:
+                continue
+
+            # Get vehicle transform (position and orientation)
+            veh_transform = vehicle.get_transform()
+            location = veh_transform.location
+            rotation = veh_transform.rotation
+
+            # World position
+            world_pos = np.array([location.x, location.y, location.z])
+            world_positions.append(world_pos)
+
+            # World velocity
+            velocity = vehicle.get_velocity()
+            world_vel = np.array([velocity.x, velocity.y, velocity.z])
+            world_velocities.append(world_vel)
+
+            # Speed (magnitude of velocity)
+            speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+            speeds.append(speed)
+
+            # Orientation (yaw, pitch, roll in degrees)
+            yaws.append(rotation.yaw)
+            pitches.append(rotation.pitch)
+            rolls.append(rotation.roll)
+
+            # Bounding box extents
+            bbox = vehicle.bounding_box
+            extent = bbox.extent
+            bbox_extents.append([extent.x, extent.y, extent.z])
+
+            # Vehicle ID and type
+            vehicle_ids.append(vehicle.id)
+            vehicle_types.append(vehicle.type_id)
+
+            # Transform position to ego frame
+            veh_world_pos_homogeneous = np.array([location.x, location.y, 1])
+            veh_ego_pos = world_to_ego @ veh_world_pos_homogeneous
+            # Negate x axis to match ego frame convention (x forward, y left)
+            ego_pos = veh_ego_pos[:2] * np.array([-1, 1])
+            ego_positions.append(ego_pos)
+
+            # Transform velocity to ego frame
+            veh_vel_world = np.array([velocity.x, velocity.y])
+            veh_vel_ego = rotation_matrix @ veh_vel_world
+            # Negate x axis to match ego frame convention
+            ego_velocities.append(veh_vel_ego * np.array([-1, 1]))
+
+            # Compute bounding box corners in ego frame
+            vehicle_yaw_deg = rotation.yaw
+            vehicle_yaw_rad = math.radians(vehicle_yaw_deg)
+            ego_yaw_rad = math.radians(gt_theta_deg)
+            relative_yaw = vehicle_yaw_rad - ego_yaw_rad
+            # Adjust for ego frame coordinate flip (x forward = negated) and add 90 degrees
+            relative_yaw = -relative_yaw + np.pi/2
+
+            # Compute corners using bounding box dimensions
+            vehicle_length = extent.x * 2.0
+            vehicle_width = extent.y * 2.0
+            corners = self._rect_corners(ego_pos, vehicle_length, vehicle_width, relative_yaw)
+            bbox_corners_ego.append(corners)
+
+        return {
+            'world_positions': np.array(world_positions) if len(world_positions) > 0 else np.zeros((0, 3)),
+            'world_velocities': np.array(world_velocities) if len(world_velocities) > 0 else np.zeros((0, 3)),
+            'speeds': np.array(speeds) if len(speeds) > 0 else np.zeros(0),
+            'yaws': np.array(yaws) if len(yaws) > 0 else np.zeros(0),
+            'pitches': np.array(pitches) if len(pitches) > 0 else np.zeros(0),
+            'rolls': np.array(rolls) if len(rolls) > 0 else np.zeros(0),
+            'bbox_extents': np.array(bbox_extents) if len(bbox_extents) > 0 else np.zeros((0, 3)),
+            'vehicle_ids': vehicle_ids,
+            'vehicle_types': vehicle_types,
+            'ego_positions': np.array(ego_positions) if len(ego_positions) > 0 else np.zeros((0, 2)),
+            'ego_velocities': np.array(ego_velocities) if len(ego_velocities) > 0 else np.zeros((0, 2)),
+            'bbox_corners_ego': bbox_corners_ego
+        }
+
+    def get_drivable_area_map(self, grid_size=200, grid_resolution=0.2, lookahead_distance=50.0):
+        """
+        Generate a binary drivable area map from CARLA using waypoint queries.
+        Ego vehicle position (x, y) is calculated from CARLA.
+
+        Args:
+            grid_size: int - size of the grid (grid_size x grid_size)
+            grid_resolution: float - resolution in meters per pixel
+            lookahead_distance: float - how far to query waypoints ahead
+
+        Returns:
+            dict: {
+                'drivable_map': numpy array of shape (grid_size, grid_size) - binary map (1=drivable, 0=not drivable)
+                'ego_location_carla': carla.Location - ego vehicle location from CARLA
+                'ego_x_carla': float - ego x position in world frame from CARLA
+                'ego_y_carla': float - ego y position in world frame from CARLA
+                'ego_yaw_carla': float - ego yaw angle in degrees from CARLA
+                'grid_center': tuple (x, y) - grid center in world coordinates
+                'grid_extent': tuple (min_x, max_x, min_y, max_y) - grid boundaries in world coordinates
+            }
+        """
+        from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
+
+        # Get ego vehicle location and transform from CARLA
+        ego_transform = self.hero_actor.get_transform()
+        ego_location = ego_transform.location
+        ego_rotation = ego_transform.rotation
+
+        # Extract ego position from CARLA
+        ego_x_carla = ego_location.x
+        ego_y_carla = ego_location.y
+        ego_z_carla = ego_location.z
+        ego_yaw_carla = ego_rotation.yaw
+
+        # Get CARLA map
+        carla_map = CarlaDataProvider.get_map()
+        if carla_map is None:
+            carla_map = self.hero_actor.get_world().get_map()
+
+        # Define grid boundaries (centered on ego vehicle)
+        grid_width = grid_size * grid_resolution
+        half_width = grid_width / 2.0
+
+        min_x = ego_x_carla - half_width
+        max_x = ego_x_carla + half_width
+        min_y = ego_y_carla - half_width
+        max_y = ego_y_carla + half_width
+
+        # Initialize binary drivable area map
+        drivable_map = np.zeros((grid_size, grid_size), dtype=np.uint8)
+
+        # Create transformation from ego frame to world frame
+        # Ego frame: x=left, y=forward (as per the trajectory plots)
+        # We need to convert ego frame grid to world coordinates accounting for rotation
+        ego_yaw_rad = math.radians(ego_yaw_carla)
+        cos_yaw = math.cos(ego_yaw_rad)
+        sin_yaw = math.sin(ego_yaw_rad)
+
+        # Sample grid points in ego frame and check if they are on drivable lanes
+        for i in range(grid_size):
+            for j in range(grid_size):
+                # Grid coordinates in ego frame (centered at 0,0)
+                # Rotate 180 deg from counter-clockwise (which was j→x, i→y): negate both
+                ego_x = -(j - grid_size / 2.0 + 0.5) * grid_resolution  # left (negated from j)
+                ego_y = -(i - grid_size / 2.0 + 0.5) * grid_resolution  # forward (negated from i)
+
+                # Transform from ego frame to world coordinates
+                # Ego frame convention: x=left, y=forward
+                # Need to rotate and translate to world frame
+                # Account for the coordinate flip: ego_x (left) = -world_left, ego_y (forward) = world_forward
+                world_x = ego_x_carla - ego_x * cos_yaw + ego_y * sin_yaw
+                world_y = ego_y_carla - ego_x * sin_yaw - ego_y * cos_yaw
+
+                # Create CARLA location
+                query_location = carla.Location(x=world_x, y=world_y, z=ego_z_carla)
+
+                # Query waypoint at this location
+                waypoint = carla_map.get_waypoint(query_location, project_to_road=True,
+                                                  lane_type=carla.LaneType.Driving)
+
+                # Check if waypoint exists and is close to query location
+                if waypoint is not None:
+                    wp_loc = waypoint.transform.location
+                    distance = math.sqrt((wp_loc.x - world_x)**2 + (wp_loc.y - world_y)**2)
+
+                    # If waypoint is close enough, mark as drivable
+                    # Use lane width as threshold
+                    if distance <= waypoint.lane_width / 2.0:
+                        drivable_map[i, j] = 1
+
+        return {
+            'drivable_map': drivable_map,
+            'ego_location_carla': ego_location,
+            'ego_x_carla': ego_x_carla,
+            'ego_y_carla': ego_y_carla,
+            'ego_yaw_carla': ego_yaw_carla,
+            'grid_center': (ego_x_carla, ego_y_carla),
+            'grid_extent': (min_x, max_x, min_y, max_y),
+            'grid_resolution': grid_resolution
+        }
