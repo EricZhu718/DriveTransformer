@@ -2648,6 +2648,10 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
 
             # Reshape: [B, num_particles, traj_dim]
             x = x_denoised.reshape(batch_size, num_particles, traj_dim)
+            
+            # Shuffle the population to avoid bias in next iteration
+            perm = torch.randperm(num_particles, device=device)
+            x = x[:, perm, :]
 
         # Final evaluation to select best trajectory
         x_flat = x.reshape(batch_size * num_particles, traj_dim)

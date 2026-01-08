@@ -557,7 +557,8 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         def reward_fn(trajectories):
             """
             Reward function that avoids collisions and stays in drivable area.
-            Emphasizes earlier timesteps more heavily.
+            Penalizes based on time-to-collision: immediate collisions heavily penalized,
+            future collisions less so. Only penalizes once based on earliest collision.
             trajectories: [B*num_particles, num_traj_tokens * 2] in unnormalized absolute coordinates
             Returns: rewards [B*num_particles] (higher is better)
             """
@@ -583,14 +584,25 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             if len(vehicles_info_for_reward['vehicle_ids']) > 0:
                 agent_bbx = vehicles_info_for_reward['bbox_corners_ego']
                 agent_vel = vehicles_info_for_reward['ego_velocities']
-                collision_scores = self.get_collision_points(
+
+                # Version 1: No tolerance (strict collision detection with safety_margin=1.0)
+                collision_scores_no_tolerance = self.get_collision_points(
                     torch.from_numpy(traj_np).float() if not isinstance(traj_reshaped, torch.Tensor) else traj_reshaped,
-                    agent_bbx, agent_vel, dt=0.2, safety_margin=1.0  # Increased safety margin
+                    agent_bbx, agent_vel, dt=0.2, safety_margin=0.0
                 )
-                if isinstance(collision_scores, torch.Tensor):
-                    collision_scores = collision_scores.cpu().numpy()
+                if isinstance(collision_scores_no_tolerance, torch.Tensor):
+                    collision_scores_no_tolerance = collision_scores_no_tolerance.cpu().numpy()
+
+                # Version 2: With tolerance (more lenient, safety_margin=0.3)
+                collision_scores_with_tolerance = self.get_collision_points(
+                    torch.from_numpy(traj_np).float() if not isinstance(traj_reshaped, torch.Tensor) else traj_reshaped,
+                    agent_bbx, agent_vel, dt=0.2, safety_margin=0.3
+                )
+                if isinstance(collision_scores_with_tolerance, torch.Tensor):
+                    collision_scores_with_tolerance = collision_scores_with_tolerance.cpu().numpy()
             else:
-                collision_scores = np.zeros((num_particles, num_timesteps))
+                collision_scores_no_tolerance = np.zeros((num_particles, num_timesteps))
+                collision_scores_with_tolerance = np.zeros((num_particles, num_timesteps))
 
             # Create time-based weights: exponential decay emphasizing earlier timesteps
             # Earlier timesteps get higher weight (more important to get right)
@@ -604,9 +616,26 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 # Higher = more time in drivable area
                 drivability_reward = (drivable_scores[i] * time_weights).sum()
 
-                # Collision penalty: weighted sum of collision scores (0 or 1 per timestep)
-                # Lower = fewer collisions
-                collision_penalty = (collision_scores[i] * time_weights).sum()
+                # Collision penalty (NO TOLERANCE): Only penalize earliest collision
+                # Find first timestep with collision
+                collision_timesteps_no_tol = np.where(collision_scores_no_tolerance[i] > 0.5)[0]
+                if len(collision_timesteps_no_tol) > 0:
+                    earliest_collision_time_no_tol = collision_timesteps_no_tol[0]
+                    # Penalty decreases exponentially with time-to-collision
+                    # Immediate collision (t=0) gets full penalty, later collisions get less
+                    time_to_collision_no_tol = earliest_collision_time_no_tol
+                    collision_penalty_no_tol = 100.0 * np.exp(-0.1 * time_to_collision_no_tol)
+                else:
+                    collision_penalty_no_tol = 0.0
+
+                # Collision penalty (WITH TOLERANCE): Only penalize earliest collision
+                collision_timesteps_with_tol = np.where(collision_scores_with_tolerance[i] > 0.5)[0]
+                if len(collision_timesteps_with_tol) > 0:
+                    earliest_collision_time_with_tol = collision_timesteps_with_tol[0]
+                    time_to_collision_with_tol = earliest_collision_time_with_tol
+                    collision_penalty_with_tol = 100.0 * np.exp(-0.1 * time_to_collision_with_tol)
+                else:
+                    collision_penalty_with_tol = 0.0
 
                 # Forward progress reward: encourage moving forward (positive y)
                 forward_progress = (traj_np[i, :, 1] * time_weights).sum()  # y = forward direction
@@ -615,9 +644,12 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 lateral_deviation = np.abs(traj_np[i, :, 0] * time_weights).sum()  # x = left direction
 
                 # Combine rewards with weights
+                # Using weighted combination: 50% no tolerance, 50% with tolerance
+                combined_collision_penalty = 0.5 * collision_penalty_no_tol + 0.5 * collision_penalty_with_tol
+
                 reward = (
                     10.0 * drivability_reward +      # Stay in drivable area (0-10)
-                    -100.0 * collision_penalty +     # Avoid collisions (large penalty)
+                    -combined_collision_penalty +    # Avoid collisions (penalty based on earliest collision)
                     0.0 * forward_progress +         # Make forward progress
                     -0.0 * lateral_deviation         # Minimize lateral deviation
                 )
@@ -891,15 +923,33 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             return torch.zeros(batch_size, num_timesteps, device=ego_trajectories.device)
 
         # Ego vehicle dimensions (length x width in meters)
-        # Coordinates are [left, forward]
+        # Coordinates are [x, y] where x=right, y=forward
         # Add safety margin to ego dimensions for conservative collision detection
-        ego_half_width = (2.0 + safety_margin) / 2.0   # half-width in left direction
-        ego_half_length = (4.5 + safety_margin) / 2.0  # half-length in forward direction
+        ego_width = 2.0 + safety_margin    # width (in x/right direction)
+        ego_length = 4.5 + safety_margin   # length (in y/forward direction)
+        ego_half_width = ego_width / 2.0
+        ego_half_length = ego_length / 2.0
 
         collision_values = torch.zeros(batch_size, num_timesteps, device=ego_trajectories.device)
 
         # Convert ego trajectories to numpy for computation
         ego_traj_np = ego_trajectories.cpu().numpy()  # (B, T, 2)
+
+        # Compute ego heading at each waypoint from consecutive positions
+        # ego_headings: [B, T] - heading angle in radians (atan2(dy, dx) where x=right, y=forward)
+        ego_headings = np.zeros((batch_size, num_timesteps))
+
+        for batch_idx in range(batch_size):
+            for t in range(num_timesteps):
+                if t < num_timesteps - 1:
+                    # Compute heading from current to next waypoint
+                    dx = ego_traj_np[batch_idx, t + 1, 0] - ego_traj_np[batch_idx, t, 0]  # x=right
+                    dy = ego_traj_np[batch_idx, t + 1, 1] - ego_traj_np[batch_idx, t, 1]  # y=forward
+                    # atan2(dy, dx) gives heading where x=right, y=forward (0° = right, 90° = forward)
+                    ego_headings[batch_idx, t] = np.arctan2(dy, dx)
+                else:
+                    # For last waypoint, use same heading as previous
+                    ego_headings[batch_idx, t] = ego_headings[batch_idx, t - 1] if t > 0 else np.pi / 2.0  # Default to forward (90°)
 
         # For each agent
         for agent_idx in range(len(agent_bbx)):
@@ -934,9 +984,20 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 ego_positions = ego_traj_np[:, t, :]  # (B, 2)
 
                 # Check collision for each trajectory using Separating Axis Theorem
-                # Test 4 axes: agent's 2 axes + ego's 2 axes (axis-aligned)
+                # Test 4 axes: agent's 2 axes + ego's 2 axes (oriented based on heading)
                 for batch_idx in range(batch_size):
-                    ego_pos = ego_positions[batch_idx]  # (2,) in [left, forward]
+                    ego_pos = ego_positions[batch_idx]  # (2,) in [x, y] where x=right, y=forward
+                    ego_heading = ego_headings[batch_idx, t]  # heading in radians (counter-clockwise from +x axis)
+
+                    # Compute ego's oriented axes based on heading
+                    cos_h = np.cos(ego_heading)
+                    sin_h = np.sin(ego_heading)
+
+                    # ego_axis2: along heading direction (length/forward direction of car, 4.5m)
+                    ego_axis2 = np.array([cos_h, sin_h])
+                    # ego_axis1: perpendicular to heading (width/lateral direction of car, 2.0m)
+                    # Perpendicular is 90° counter-clockwise: if heading is θ, perpendicular is θ+90°
+                    ego_axis1 = np.array([-sin_h, cos_h])
 
                     # Vector from agent center to ego center
                     diff = ego_pos - future_center  # (2,)
@@ -945,29 +1006,29 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
 
                     # Test agent's axis 1
                     proj_diff = np.abs(np.dot(diff, axis1))
-                    # Ego box projected onto agent's axis1: sum of absolute projections
-                    ego_proj = ego_half_width * np.abs(axis1[0]) + ego_half_length * np.abs(axis1[1])
+                    # Ego box projected onto agent's axis1
+                    ego_proj = ego_half_width * np.abs(np.dot(ego_axis1, axis1)) + ego_half_length * np.abs(np.dot(ego_axis2, axis1))
                     if proj_diff > half_len1 + ego_proj:
                         collision = False
                         continue
 
                     # Test agent's axis 2
                     proj_diff = np.abs(np.dot(diff, axis2))
-                    ego_proj = ego_half_width * np.abs(axis2[0]) + ego_half_length * np.abs(axis2[1])
+                    ego_proj = ego_half_width * np.abs(np.dot(ego_axis1, axis2)) + ego_half_length * np.abs(np.dot(ego_axis2, axis2))
                     if proj_diff > half_len2 + ego_proj:
                         collision = False
                         continue
 
-                    # Test ego's axis 1 (left direction: [1, 0])
-                    proj_diff = np.abs(diff[0])  # Projection onto [1, 0]
-                    agent_proj = half_len1 * np.abs(axis1[0]) + half_len2 * np.abs(axis2[0])
+                    # Test ego's axis 1 (perpendicular to heading - width direction)
+                    proj_diff = np.abs(np.dot(diff, ego_axis1))
+                    agent_proj = half_len1 * np.abs(np.dot(axis1, ego_axis1)) + half_len2 * np.abs(np.dot(axis2, ego_axis1))
                     if proj_diff > ego_half_width + agent_proj:
                         collision = False
                         continue
 
-                    # Test ego's axis 2 (forward direction: [0, 1])
-                    proj_diff = np.abs(diff[1])  # Projection onto [0, 1]
-                    agent_proj = half_len1 * np.abs(axis1[1]) + half_len2 * np.abs(axis2[1])
+                    # Test ego's axis 2 (along heading - length direction)
+                    proj_diff = np.abs(np.dot(diff, ego_axis2))
+                    agent_proj = half_len1 * np.abs(np.dot(axis1, ego_axis2)) + half_len2 * np.abs(np.dot(axis2, ego_axis2))
                     if proj_diff > ego_half_length + agent_proj:
                         collision = False
                         continue
@@ -1257,6 +1318,15 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                               linewidth=1.5, alpha=0.5, zorder=5)
                 ax.add_patch(poly)
 
+            # Draw velocity vectors for all vehicles
+            for i in range(len(vehicles_info['vehicle_ids'])):
+                ego_pos = vehicles_info['ego_positions'][i]
+                ego_vel = vehicles_info['ego_velocities'][i]
+                # Draw arrow from vehicle position in direction of velocity
+                ax.arrow(ego_pos[0], ego_pos[1], ego_vel[0], ego_vel[1],
+                        head_width=0.5, head_length=0.5, fc='blue', ec='blue',
+                        alpha=0.7, linewidth=2, zorder=20)
+
             # Draw ego vehicle
             ax.plot(0, 0, 'yo', markersize=12, label='Ego Vehicle', zorder=100)
             ax.set_title('Initial Proposals: Blue=Drivable, Red=Non-Drivable, Orange X=Collision')
@@ -1465,7 +1535,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         # Optimization: Compute on a coarse 50x50 grid then resize to requested grid_size
         # This reduces CARLA queries from 40,000 (200x200) to 2,500 (50x50) - 16x speedup!
         coarse_grid_size = 100
-        coarse_resolution = 0.2  # 100 * 0.2 = 20m coverage (±10m from center)
+        coarse_resolution = 0.4  # 100 * 0.4 = 40m coverage (±20m from center)
 
         # Define grid boundaries (centered on ego vehicle) using coarse resolution
         grid_width = coarse_grid_size * coarse_resolution
@@ -1525,6 +1595,10 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         else:
             drivable_map = coarse_map
 
+        # Calculate actual resolution of the final map
+        # Physical coverage is grid_width (20m), spread over grid_size pixels
+        actual_resolution = grid_width / grid_size
+
         return {
             'drivable_map': drivable_map,
             'ego_location_carla': ego_location,
@@ -1533,5 +1607,5 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             'ego_yaw_carla': ego_yaw_carla,
             'grid_center': (ego_x_carla, ego_y_carla),
             'grid_extent': (min_x, max_x, min_y, max_y),
-            'grid_resolution': grid_resolution
+            'grid_resolution': actual_resolution
         }
