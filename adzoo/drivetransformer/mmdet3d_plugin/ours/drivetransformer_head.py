@@ -393,6 +393,7 @@ class DiffusionHead(nn.Module):
 
 
         stats_file = 'trajectory_normalization_stats.json'
+        # stats_file = '/zfsauton2/home/ezhu3/Bench2Drive/DriveTransformer/trajectory_normalization_stats.json'
 
         if os.path.exists(stats_file):
             with open(stats_file, 'r') as f:

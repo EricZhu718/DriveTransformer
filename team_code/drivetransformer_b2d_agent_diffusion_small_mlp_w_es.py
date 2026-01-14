@@ -588,7 +588,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 # Version 1: No tolerance (strict collision detection with safety_margin=1.0)
                 collision_scores_no_tolerance = self.get_collision_points(
                     torch.from_numpy(traj_np).float() if not isinstance(traj_reshaped, torch.Tensor) else traj_reshaped,
-                    agent_bbx, agent_vel, dt=0.2, safety_margin=0.0
+                    agent_bbx, agent_vel, dt=0.2, safety_margin=1.0
                 )
                 if isinstance(collision_scores_no_tolerance, torch.Tensor):
                     collision_scores_no_tolerance = collision_scores_no_tolerance.cpu().numpy()
@@ -1340,7 +1340,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             if self.save_path is not None:
                 bev_viz_dir = self.save_path / 'bev_viz'
                 bev_viz_dir.mkdir(parents=True, exist_ok=True)
-                save_path = bev_viz_dir / f'bev_traj_{frame:04d}.png'
+                save_path = bev_viz_dir / f'bev_traj_{frame:04d}.jpg'
                 plt.savefig(str(save_path), dpi=100)
 
             plt.close(fig)
