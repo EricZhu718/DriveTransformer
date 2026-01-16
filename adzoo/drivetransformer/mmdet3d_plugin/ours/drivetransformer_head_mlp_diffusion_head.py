@@ -1205,6 +1205,74 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             self.map_reference_points.weight[..., 1] = y.flatten()
         nn.init.constant_(self.map_query.weight, 0)
 
+    def query_drivable_area_for_map_anchors(self, map_reference_points, drivable_area_map):
+        """
+        Query drivable area at map anchor/reference point locations (vectorized).
+        
+        Args:
+            map_reference_points: Tensor of shape [B, num_map_queries, 2] with (x, y) anchor coordinates
+                                 in the ego-centric LiDAR coordinate system (x=lateral, y=longitudinal)
+            drivable_area_map: Tensor or numpy array of shape [B, H, W] or [H, W] boolean drivable area map
+                              covering range [-30, 30] x [-30, 30] meters
+            
+        Returns:
+            drivable_mask: Tensor of shape [B, num_map_queries] with boolean drivability at each anchor
+            
+        Note:
+            - Map reference points are in pc_range: x ∈ [-15, 15], y ∈ [-30, 30]
+            - Drivable area map covers: x ∈ [-30, 30], y ∈ [-30, 30]
+            - Coordinates are ego-centric: (0,0) is the ego vehicle position
+            - x-axis: lateral (left/right), y-axis: longitudinal (forward/backward)
+        """
+        device = map_reference_points.device
+        B, num_queries, _ = map_reference_points.shape
+        
+        # Drivable area map range (hardcoded to match the .npy files)
+        x_min, x_max = -30.0, 30.0
+        y_min, y_max = -30.0, 30.0
+        
+        # Convert drivable_area_map to tensor if needed
+        if isinstance(drivable_area_map, np.ndarray):
+            drivable_area_map = torch.from_numpy(drivable_area_map).to(device)
+        elif not isinstance(drivable_area_map, torch.Tensor):
+            # Handle memoryview or other types
+            drivable_area_map = torch.from_numpy(np.array(drivable_area_map)).to(device)
+        
+        # Ensure drivable_area_map is on the same device
+        drivable_area_map = drivable_area_map.to(device)
+        
+        # Get map dimensions
+        if drivable_area_map.dim() == 2:
+            # Single map, expand to batch
+            drivable_area_map = drivable_area_map.unsqueeze(0).expand(B, -1, -1)
+        
+        H, W = drivable_area_map.shape[1], drivable_area_map.shape[2]
+        
+        # Extract x, y coordinates
+        x = map_reference_points[..., 0]  # [B, num_queries]
+        y = map_reference_points[..., 1]  # [B, num_queries]
+        
+        # Check bounds
+        valid = (x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max)
+        
+        # Convert from world coordinates to array indices
+        col = ((x - x_min) / (x_max - x_min) * W).long()
+        row = ((y - y_min) / (y_max - y_min) * H).long()
+        
+        # Clamp to valid indices
+        col = torch.clamp(col, 0, W - 1)
+        row = torch.clamp(row, 0, H - 1)
+        
+        # Query the map (vectorized)
+        # Use advanced indexing: for each batch, gather from the corresponding map
+        batch_indices = torch.arange(B, device=device).view(B, 1).expand(-1, num_queries)
+        drivable_values = drivable_area_map[batch_indices, row, col]  # [B, num_queries]
+        
+        # Only mark as drivable if within bounds AND actually drivable
+        drivable_mask = valid & drivable_values
+        
+        return drivable_mask
+
     @force_fp32()
     def forward(self,
                 img_feats,
@@ -1505,6 +1573,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             'intermediate_agent_query': intermediate_agent_query, # [N_layers+1, B, N_agent_query, D] (includes initial)
             'intermediate_map_query': intermediate_map_query, # [N_layers+1, B, N_map_query, D] (includes initial)
             'intermediate_ego_query': intermediate_ego_query, # [N_layers+1, B, N_ego_mode, D] (includes initial)
+            'map_reference_points': map_reference_points, # [B, N_map_query, 2] - map anchor positions in ego frame
         }
 
         # add the intermedaite outputs for inference
@@ -3245,6 +3314,10 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         num_samples = len(det_preds_dicts)
         assert len(det_preds_dicts) == len(map_preds_dicts), \
              'len(preds_dict) should be equal to len(map_preds_dicts)'
+        
+        # Extract map_reference_points from preds_dicts
+        map_reference_points = preds_dicts.get('map_reference_points', None)
+        
         ret_list = []
         for i in range(num_samples):
             preds = det_preds_dicts[i]
@@ -3265,8 +3338,12 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             map_scores = map_preds['map_scores']
             map_labels = map_preds['map_labels']
             map_pts = map_preds['map_pts']
+            
+            # Extract map_reference_points for this sample
+            map_ref_pts = map_reference_points[i] if map_reference_points is not None else None
+            
             ret_list.append([bboxes, scores, labels, trajs, map_bboxes,
-                             map_scores, map_labels, map_pts])
+                             map_scores, map_labels, map_pts, map_ref_pts])
 
         return ret_list
 

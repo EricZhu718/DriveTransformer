@@ -46,7 +46,7 @@ class B2D_DriveTransformer_Dataset(Custom3DDataset):
                  sub_seq_lenth=20, # max sequence lenth for sampler. -1 means using whole clip as a sequence.
                  use_splited_data=True, # To reduce time of initialization and save memory, we do not read data of all clips at beginning (like UniAD/VAD reproduced in Bench2DriveZoo).
                                         # instead, we read a clip data if it is needed during training.
-                 cache_lenth=4, # the number of clip data cached in memory. 
+                 cache_lenth=4, # the number of clip data cached in memory.
                  *args,
                  **kwargs):
         
@@ -104,6 +104,21 @@ class B2D_DriveTransformer_Dataset(Custom3DDataset):
         
         end_time = time.time()
         print('finish loading. dataset lenth: '+str(len(self.flag)) +' loading time: '+str(end_time-start_time)+'s')
+        
+        # Check if pipeline will collect drivable_area
+        self._load_drivable_area = self._should_load_drivable_area()
+        
+    def _should_load_drivable_area(self):
+        """Check if the pipeline is configured to collect drivable_area."""
+        if not hasattr(self, 'pipeline') or self.pipeline is None:
+            return False
+        
+        # Check if any transform in pipeline is CustomCollect3D with 'drivable_area' in keys
+        for transform in self.pipeline.transforms:
+            if transform.__class__.__name__ == 'CustomCollect3D':
+                if hasattr(transform, 'keys') and 'drivable_area' in transform.keys:
+                    return True
+        return False
         
         
     def __len__(self):
@@ -426,6 +441,20 @@ class B2D_DriveTransformer_Dataset(Custom3DDataset):
         prev_exists = not (index == 0 or self.flag[index - 1] != self.flag[index]) 
         input_dict['index'] = index
         input_dict['prev_exists'] = prev_exists
+        
+        # Load drivable area map if pipeline is configured to collect it
+        if self._load_drivable_area:
+            drivable_area_path = osp.join(self.data_root, info['folder'], 'drivable_area', f"{info['frame_idx']:05d}.npy")
+            if osp.exists(drivable_area_path):
+                try:
+                    drivable_area = np.load(drivable_area_path)  # Shape: (300, 300), dtype: bool
+                    input_dict['drivable_area'] = drivable_area
+                except Exception as e:
+                    print(f"Warning: Failed to load drivable area from {drivable_area_path}: {e}")
+                    input_dict['drivable_area'] = None
+            else:
+                input_dict['drivable_area'] = None
+        
         return input_dict
     
     def get_command_xy_in_local(self, command_xy, ego_xy, ego_theta):

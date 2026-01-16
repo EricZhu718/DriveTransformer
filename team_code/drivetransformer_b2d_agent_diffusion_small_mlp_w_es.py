@@ -508,7 +508,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         output_data_batch = self.model(input_data_batch, return_loss=False, rescale=True)
 
         # output_data_batch as predictions for the whole batch
-        # dict_keys(['boxes_3d', 'scores_3d', 'labels_3d', 'trajs_3d', 'map_boxes_3d', 'map_scores_3d', 'map_labels_3d', 'map_pts_3d', 'ego_fut_cmd', 'ego_fut_preds_fix_time', 'ego_fut_preds_fix_dist'])
+        # dict_keys(['boxes_3d', 'scores_3d', 'labels_3d', 'trajs_3d', 'map_boxes_3d', 'map_scores_3d', 'map_labels_3d', 'map_pts_3d', 'ego_fut_cmd', 'ego_fut_preds_fix_time', 'ego_fut_preds_fix_dist', 'map_reference_points'])
         # output_data_batch[0]['trajs_3d']: shape of (100, 6, 12)
         # output_data_batch[0]['labels_3d'] : shape of (100,) discrete for each class
         # output_data_batch[0]['scores_3d'] : shape of (100,) from 0 to 1
@@ -517,6 +517,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         # output_data_batch[0]['map_pts_3d']: shape of (33, 20, 2)
         # output_data_batch[0]['ego_fut_preds_fix_time']: shape of (1,1,30,2)
         # output_data_batch[0]['ego_fut_preds_fix_dist']: shape of (1,1,20,2)
+        # output_data_batch[0]['map_reference_points']: shape of (100, 2) - map anchor positions in ego frame
 
         # ========================================================================
         # DIFFUSION SAMPLING: Replace fixed trajectories with diffusion-generated ones
@@ -749,7 +750,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
 
         if self.step % 20 == 0 and self.should_save_data:
             start_time = time.time()
-            self.save(tick_data, diffusion_es_outputs, draw_traj=True)
+            self.save(tick_data, diffusion_es_outputs, output_data_batch, draw_traj=True)
             end_time = time.time()
             print(f"Visualization saved in {end_time-start_time:.2f} seconds.", flush=True)
 
@@ -1046,7 +1047,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
 
 
 
-    def save(self, tick_data, diffusion_es_outputs, draw_traj=False):
+    def save(self, tick_data, diffusion_es_outputs, output_data_batch, draw_traj=False):
         frame = self.step // 10
 
         bev_frame = tick_data['bev'].copy()
@@ -1162,6 +1163,26 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 axes[ax_idx].arrow(ego_pos[0], ego_pos[1], ego_vel[0], ego_vel[1],
                                   head_width=0.5, head_length=0.5, fc='blue', ec='blue',
                                   alpha=0.7, linewidth=2, zorder=20)
+
+            # Draw map anchor points if available
+            if 'map_reference_points' in output_data_batch[0]:
+                map_anchors = output_data_batch[0]['map_reference_points']  # [num_queries, 2]
+                if isinstance(map_anchors, torch.Tensor):
+                    map_anchors_np = map_anchors.cpu().numpy()
+                else:
+                    map_anchors_np = map_anchors
+                
+                # Plot all anchor points as small dots
+                axes[ax_idx].scatter(map_anchors_np[:, 0], map_anchors_np[:, 1],
+                                    c='purple', s=20, alpha=0.6, marker='.',
+                                    label='Map Anchors', zorder=3)
+                # Label each anchor point with two-line x/y values
+                for x, y in map_anchors_np:
+                    axes[ax_idx].text(
+                        x + 0.2, y + 0.2,
+                        f"x: {x:.1f}\ny: {y:.1f}",
+                        color='purple', fontsize=6, alpha=0.7, zorder=4
+                    )
 
             axes[ax_idx].set_xlabel('Left (m)')
             axes[ax_idx].set_ylabel('Forward (m)')
@@ -1341,7 +1362,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 bev_viz_dir = self.save_path / 'bev_viz'
                 bev_viz_dir.mkdir(parents=True, exist_ok=True)
                 save_path = bev_viz_dir / f'bev_traj_{frame:04d}.jpg'
-                plt.savefig(str(save_path), dpi=100)
+                plt.savefig(str(save_path), dpi=300)
 
             plt.close(fig)
 

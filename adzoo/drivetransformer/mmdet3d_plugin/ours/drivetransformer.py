@@ -244,7 +244,7 @@ class DriveTransformer(MVXTwoStageDetector):
         bbox_list = self.pts_bbox_head.get_bboxes(outs, img_metas)
         bbox_results = []
         for i, (bboxes, scores, labels, trajs, map_bboxes, \
-                map_scores, map_labels, map_pts) in enumerate(bbox_list):
+                map_scores, map_labels, map_pts, map_ref_pts) in enumerate(bbox_list):
             bbox_result = bbox3d2result(bboxes, scores, labels)
             bbox_result['trajs_3d'] = trajs.cpu()
             map_bbox_result = dict(
@@ -261,6 +261,8 @@ class DriveTransformer(MVXTwoStageDetector):
                 bbox_result['ego_fut_preds_fix_dist'] = outs['ego_fut_preds_fix_dist'][-1].cpu()
             if 'all_traj_cls_scores' in outs and outs['all_traj_cls_scores'] is not None:
                 bbox_result['agent_traj_cls_scores'] = outs['all_traj_cls_scores'][-1].cpu()
+            if map_ref_pts is not None:
+                bbox_result['map_reference_points'] = map_ref_pts.cpu()
             bbox_results.append(bbox_result)
 
         return bbox_results

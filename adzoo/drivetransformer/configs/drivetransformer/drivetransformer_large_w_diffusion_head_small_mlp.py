@@ -442,7 +442,7 @@ train_pipeline = [
          keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'ego_his_trajs', 'fut_valid_flag_fix_time',
                'ego_fut_trajs_fix_time', 'ego_fut_masks_fix_time', 'fut_valid_flag_fix_dist',
                'ego_fut_trajs_fix_dist', 'ego_fut_masks_fix_dist', 'ego_fut_cmd', 'ego_lcf_feat', 
-               'gt_attr_labels', 'prev_exists', 'index'] + collect_keys)
+               'gt_attr_labels', 'prev_exists', 'index', 'drivable_area'] + collect_keys)
 ]
 
 test_pipeline = [
@@ -458,7 +458,7 @@ test_pipeline = [
          keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'ego_his_trajs', 'fut_valid_flag_fix_time',
                'ego_fut_trajs_fix_time', 'ego_fut_masks_fix_time', 'fut_valid_flag_fix_dist',
                'ego_fut_trajs_fix_dist', 'ego_fut_masks_fix_dist', 'ego_fut_cmd', 'ego_lcf_feat', 
-               'gt_attr_labels', 'prev_exists', 'index'] + collect_keys)
+               'gt_attr_labels', 'prev_exists', 'index', 'drivable_area'] + collect_keys)
 
 ]
 
@@ -490,7 +490,7 @@ data = dict(
         sample_interval_ego_fut=1,
         sample_interval=5,
         fix_future_dis=1,       
-        use_angle_as_dis_traj=True, 
+        use_angle_as_dis_traj=True,
         ),
     val=dict(        
         type=dataset_type,
@@ -516,7 +516,7 @@ data = dict(
         sample_interval_ego_fut=1,
         sample_interval=5,
         fix_future_dis=1,        
-        use_angle_as_dis_traj=True, 
+        use_angle_as_dis_traj=True,
         ),
     test=dict(        
         type=dataset_type,
@@ -542,7 +542,7 @@ data = dict(
         sample_interval_ego_fut=1,
         sample_interval=5,
         fix_future_dis=1,   
-        use_angle_as_dis_traj=True, 
+        use_angle_as_dis_traj=True,
         ),
     shuffler_sampler=dict(type='InfiniteGroupEachSampleInBatchSampler'),
     nonshuffler_sampler=dict(type='DistributedSampler')
