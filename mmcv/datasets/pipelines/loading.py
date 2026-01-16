@@ -528,6 +528,64 @@ class LoadMultiViewImageFromFiles(object):
 
 
 @PIPELINES.register_module()
+class LoadDrivableArea(object):
+    """Load drivable area map from file.
+    
+    Expects results['drivable_area_path'] to be set.
+    Loads drivable area as part of the pipeline (same as images).
+    
+    Args:
+        to_uint8 (bool): Convert bool array to uint8 to save memory. Defaults to True.
+    """
+    
+    def __init__(self, to_uint8=True):
+        self.to_uint8 = to_uint8
+    
+    def __call__(self, results):
+        """Load drivable area from file.
+        
+        Args:
+            results (dict): Result dict with 'drivable_area_path' key.
+        
+        Returns:
+            dict: Result dict with 'drivable_area' added.
+        """
+        if 'drivable_area_path' not in results:
+            results['drivable_area'] = None
+            return results
+        
+        drivable_area_path = results['drivable_area_path']
+        
+        try:
+            import os.path as osp
+            import numpy as np
+            
+            if not osp.exists(drivable_area_path):
+                results['drivable_area'] = None
+                return results
+            
+            # Load directly without mmap to avoid memory leak from unclosed file handles
+            drivable_area = np.load(drivable_area_path)
+            
+            # Convert to uint8 to reduce memory footprint (1 byte vs 8+ bytes for bool)
+            if self.to_uint8:
+                drivable_area = np.ascontiguousarray(drivable_area, dtype=np.uint8)
+            
+            results['drivable_area'] = drivable_area
+        except Exception as e:
+            print(f"Warning: Failed to load drivable area from {drivable_area_path}: {e}")
+            results['drivable_area'] = None
+        
+        return results
+    
+    def __repr__(self):
+        """str: Return a string that describes the module."""
+        repr_str = self.__class__.__name__
+        repr_str += f'(to_uint8={self.to_uint8})'
+        return repr_str
+
+
+@PIPELINES.register_module()
 class LoadImageFromFileMono3D(LoadImageFromFile):
     """Load an image from file in monocular 3D object detection. Compared to 2D
     detection, additional camera parameters need to be loaded.

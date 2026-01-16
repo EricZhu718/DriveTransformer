@@ -442,18 +442,12 @@ class B2D_DriveTransformer_Dataset(Custom3DDataset):
         input_dict['index'] = index
         input_dict['prev_exists'] = prev_exists
         
-        # Load drivable area map if pipeline is configured to collect it
+        # Set drivable area path to be loaded by LoadDrivableArea pipeline step
         if self._load_drivable_area:
             drivable_area_path = osp.join(self.data_root, info['folder'], 'drivable_area', f"{info['frame_idx']:05d}.npy")
-            if osp.exists(drivable_area_path):
-                try:
-                    drivable_area = np.load(drivable_area_path)  # Shape: (300, 300), dtype: bool
-                    input_dict['drivable_area'] = drivable_area
-                except Exception as e:
-                    print(f"Warning: Failed to load drivable area from {drivable_area_path}: {e}")
-                    input_dict['drivable_area'] = None
-            else:
-                input_dict['drivable_area'] = None
+            input_dict['drivable_area_path'] = drivable_area_path
+        else:
+            input_dict['drivable_area_path'] = None
         
         return input_dict
     

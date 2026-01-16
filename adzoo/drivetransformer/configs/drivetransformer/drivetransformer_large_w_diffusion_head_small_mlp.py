@@ -133,7 +133,7 @@ map_num_propagated = 50
 memory_len_frame = 10
 num_mode = 6
 num_gpus = 4
-batch_size = 10
+batch_size = 6
 num_iters_per_epoch = 200000 // (num_gpus * batch_size)
 
 data_aug_conf = {
@@ -228,8 +228,13 @@ model = dict(
         depth_num=64,
 
         ## Diffusion Head
-        use_diffusion_loss=True,
-        only_finetune_diffusion=True,
+        finetune_diffusion=True,
+
+        ## Area Prediction
+        finetune_drivable_area=True,
+
+        ## Freeze the main transformer
+        freeze_transformer=True,
   
         ## InitLayer
         agent_prep_decoder=dict(
@@ -431,6 +436,7 @@ file_client_args = dict(backend='disk')
 
 train_pipeline = [
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
+    dict(type='LoadDrivableArea', to_uint8=True),
     dict(type="ResizeCropFlipImage"),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=True),
@@ -447,6 +453,7 @@ train_pipeline = [
 
 test_pipeline = [
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
+    dict(type='LoadDrivableArea', to_uint8=True),
     dict(type="ResizeCropFlipImage"),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=True),
@@ -464,7 +471,7 @@ test_pipeline = [
 
 data = dict(
     samples_per_gpu=batch_size,
-    workers_per_gpu=12,
+    workers_per_gpu=3,  # Reduced from 12 to avoid memory spike (each worker copies ~7GB map_infos)
     train = dict(
         type = dataset_type,
         data_root=data_root,

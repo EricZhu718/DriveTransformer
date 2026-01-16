@@ -130,6 +130,7 @@ class DriveTransformer(MVXTwoStageDetector):
                       ego_fut_cmd=None,
                       ego_lcf_feat=None,
                       gt_attr_labels=None,
+                      drivable_area=None,
                       **data,
                       ):
         """Forward training function.
@@ -183,6 +184,7 @@ class DriveTransformer(MVXTwoStageDetector):
             ego_fut_cmd=ego_fut_cmd,
             ego_fut_classes=ego_fut_classes,
             gt_attr_labels=gt_attr_labels,
+            drivable_area_map=drivable_area,
             ## Prediction
             preds_dicts=preds_dicts,
             img_metas=img_metas

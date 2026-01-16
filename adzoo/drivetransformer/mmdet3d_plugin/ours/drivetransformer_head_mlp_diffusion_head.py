@@ -630,19 +630,32 @@ class DrivableAreaHead(nn.Module):
             self.apply(init_fn)
 
     def _extract_last_hidden_linear(self, branch, x):
-        """Return the output right after the last hidden Linear, before its activation."""
-        if isinstance(branch, nn.Sequential):
-            last_linear_out = None
-            for idx, module in enumerate(branch):
-                if idx == len(branch) - 1:
-                    break  # skip the final prediction layer
+        """Return the output right after the last hidden FC layer, before activations and final prediction.
+        
+        For branches like: LayerNorm -> Linear -> SiLU -> Linear -> SiLU -> Linear(final)
+        We want the output after the second Linear (last hidden FC), before the final prediction Linear.
+        """
+        if not isinstance(branch, nn.Sequential):
+            # Shouldn't happen if branches aren't modified, but handle gracefully
+            return x
+        
+        # Find all Linear layer indices
+        linear_indices = [i for i, m in enumerate(branch) if isinstance(m, nn.Linear)]
+        
+        if len(linear_indices) < 2:
+            # If there's only one Linear, process everything except the last module
+            for module in branch[:-1]:
                 x = module(x)
-                if isinstance(module, nn.Linear):
-                    last_linear_out = x
-            return last_linear_out if last_linear_out is not None else x
-
-        # Fallback for non-sequential branches (e.g., a single Linear)
-        return branch(x)
+            return x
+        
+        # Process up to and including the second-to-last Linear layer (last hidden FC)
+        last_hidden_fc_idx = linear_indices[-2]
+        for i, module in enumerate(branch):
+            if i > last_hidden_fc_idx:
+                break
+            x = module(x)
+        
+        return x
 
     def forward(self, intermediate_map_query, map_cls_branches, map_reg_branches, map_reference_points, map_ref_embedding):
         """Compute drivable logits for each decoder layer.
@@ -783,8 +796,8 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         loss_plan_reg_fix_dist=None,
         loss_plan_cls=None,
         ## Diffusion Loss
-        use_diffusion_loss=False,
-        only_finetune_diffusion=False,
+        finetune_diffusion=False,
+        freeze_transformer=False,
         diffusion_loss_weight=1.0,
         diffusion_num_timesteps=1000,
         diffusion_beta_start=0.0001,
@@ -802,6 +815,8 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         fut_ts_ego_fix_dist=None,
         fut_ts_ego_fix_time=None,
         fut_ego_fix_dist=False,
+        ## Finetune toggles
+        finetune_drivable_area=False,
     ):
     
         super().__init__()
@@ -972,15 +987,18 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         self.loss_plan_reg_fix_time = build_loss(loss_plan_reg_fix_time)
         self.loss_plan_cls = build_loss(loss_plan_cls)
         ## Diffusion Loss
-        self.use_diffusion_loss = use_diffusion_loss
-        self.only_finetune_diffusion = only_finetune_diffusion,
+        self.finetune_diffusion = finetune_diffusion
+        self.freeze_transformer = freeze_transformer
+        self.finetune_drivable_area = finetune_drivable_area
+        # Use drivable area supervision when finetuning drivable-area head
+        self.use_map_drivable_supervision = finetune_drivable_area
         self.diffusion_loss_weight = diffusion_loss_weight
         self.diffusion_loss_type = diffusion_loss_type
         self.diffusion_num_traj_tokens = diffusion_num_traj_tokens
         self.diffusion_num_timesteps = diffusion_num_timesteps
         self.diffusion_num_heads = diffusion_num_heads
         self.diffusion_ffn_dim = diffusion_ffn_dim
-        if use_diffusion_loss:
+        if self.finetune_diffusion:
             # Initialize diffusion scheduler
             self.diffusion_scheduler = DiffusionScheduler(
                 num_timesteps=diffusion_num_timesteps,
@@ -1094,6 +1112,11 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         ## Major Layer
         self.transformer = build_transformer(transformer)
 
+        # Optionally freeze transformer parameters
+        if self.freeze_transformer:
+            for p in self.transformer.parameters():
+                p.requires_grad = False
+
         self.init_output_head()
         self.reset_memory()
         self.pseudo_map_instance = None
@@ -1203,7 +1226,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         # Create a single trajectory denoiser to be called once during diffusion loss.
         # The denoiser supports being passed many context tensors (one per decoder
         # layer + initial state) while tokenizing the noisy trajectory only once.
-        if self.use_diffusion_loss:
+        if self.finetune_diffusion:
             self.diffusion_head = DiffusionHead(
                 embed_dims=self.embed_dims,
                 num_traj_tokens=self.diffusion_num_traj_tokens,
@@ -1214,8 +1237,8 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
                 ego_traj_branches_fix_time=self.ego_traj_branches_fix_time
             )
 
-        # Freeze all components except diffusion head when only finetuning diffusion
-        if self.only_finetune_diffusion:
+        # Freeze all components except diffusion head when finetuning diffusion
+        if self.freeze_transformer:
             # Freeze transformer
             for param in self.transformer.parameters():
                 param.requires_grad = False
@@ -1238,8 +1261,10 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
                 param.requires_grad = False
             for param in self.map_reg_branches.parameters():
                 param.requires_grad = False
-            for param in self.drivable_area_head.parameters():
-                param.requires_grad = False
+            # Keep drivable area head trainable if finetuning it
+            if not self.finetune_drivable_area:
+                for param in self.drivable_area_head.parameters():
+                    param.requires_grad = False
             for param in self.ego_traj_branches_fix_time.parameters():
                 param.requires_grad = False
             if hasattr(self, 'ego_traj_branches_fix_dist') and self.ego_traj_branches_fix_dist is not None:
@@ -1383,7 +1408,8 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         drivable_values = drivable_area_map[batch_indices, row, col]  # [B, num_queries]
         
         # Only mark as drivable if within bounds AND actually drivable
-        drivable_mask = valid & drivable_values
+        # Convert drivable_values to bool if it's float, then use logical AND
+        drivable_mask = valid & (drivable_values > 0.5).bool()
 
         if return_valid_mask:
             return drivable_mask, valid
@@ -1400,8 +1426,8 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
                 **data,
             ):
 
-        # Detach all inputs if only finetuning diffusion (to prevent gradients to frozen components)
-        if self.only_finetune_diffusion:
+        # Detach all inputs if finetuning diffusion (to prevent gradients to frozen components)
+        if self.freeze_transformer:
             img_feats = img_feats.detach()
             if ego_lcf_feat is not None and isinstance(ego_lcf_feat, torch.Tensor):
                 ego_lcf_feat = ego_lcf_feat.detach()
@@ -1438,8 +1464,8 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             agent_temp_memory, map_temp_memory, \
                 agent_temp_pos, map_temp_pos, ego_temp_pos, rec_ego_pose = self.temporal_alignment(agent_query, map_query)
 
-        # Wrap in no_grad when only finetuning diffusion to save memory
-        if self.only_finetune_diffusion:
+        # Wrap in no_grad when freezing transformer
+        if self.freeze_transformer:
             with torch.no_grad():
                 ## Init PE
                 agent_pe = self.agent_ref_embedding(pos2posemb(agent_reference_points, self.embed_dims//2))
@@ -1561,7 +1587,8 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             ego_prep_traj_ref_fix_dist = self.ego_traj_branches_fix_dist[-1](ego_query).view(bs, ego_query.shape[1], self.fut_ts_ego_fix_dist, 1) if self.fut_ego_fix_dist else None
             ego_prep_traj_cls = self.traj_cls_branches[-1](ego_query) if self.ego_multi_modal else None
         # major transformer
-        if self.only_finetune_diffusion:
+        if self.freeze_transformer:
+            # Run transformer without gradients, but keep other components trainable
             with torch.no_grad():
                 agent_query, map_query, ego_query, results = self.transformer(
                     agent_query, # [B, N_agent_query, D] ||| queries and position embeddings
@@ -1604,11 +1631,6 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
                     ego_traj_cls_branches=self.ego_traj_cls_branches,
                     return_intermediate_queries=True,
                 )
-            # Detach outputs to prevent gradients flowing back through frozen transformer
-            agent_query = agent_query.detach()
-            map_query = map_query.detach()
-            ego_query = ego_query.detach()
-            results = [[r.detach() if r is not None else None for r in layer_results] for layer_results in results]
         else:
             agent_query, map_query, ego_query, results = self.transformer(
                 agent_query, # [B, N_agent_query, D] ||| queries and position embeddings
@@ -1659,7 +1681,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
 
         # Drivable area logits for each decoder stage (including initial state)
         map_drivable_logits = None
-        if intermediate_map_query is not None:
+        if intermediate_map_query is not None and self.finetune_drivable_area:
             map_drivable_logits = self.drivable_area_head(
                 intermediate_map_query,
                 self.map_cls_branches,
@@ -2355,7 +2377,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         Returns:
             loss_diffusion: Scalar diffusion loss
         """
-        if not self.use_diffusion_loss:
+        if not self.finetune_diffusion:
             return None
         
         # Check if we have valid queries and GT trajectory
@@ -2555,8 +2577,8 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             trajectories: Generated trajectory [B, num_traj_tokens * 2] in normalized differential space
                          Can be unnormalized using diffusion_head.unnormalize_trajectory()
         """
-        if not self.use_diffusion_loss:
-            raise RuntimeError("Diffusion not enabled. Set use_diffusion_loss=True in config.")
+        if not self.finetune_diffusion:
+            raise RuntimeError("Diffusion not enabled. Set finetune_diffusion=True in config.")
 
         if device is None:
             device = self.diffusion_scheduler.betas.device
@@ -2704,8 +2726,8 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
                     'top_k_trajectories': Top-k trajectories [B, top_k, num_traj_tokens, 2] in unnormalized coordinates
                     'rewards': Rewards for all particles [B, num_particles]
         """
-        if not self.use_diffusion_loss:
-            raise RuntimeError("Diffusion not enabled. Set use_diffusion_loss=True in config.")
+        if not self.finetune_diffusion:
+            raise RuntimeError("Diffusion not enabled. Set finetune_diffusion=True in config.")
 
         if device is None:
             device = self.diffusion_scheduler.betas.device
@@ -3226,8 +3248,12 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         assert gt_bboxes_ignore is None, \
             f'{self.__class__.__name__} only supports ' \
             f'for gt_bboxes_ignore setting to None.'
+        
+        # Initialize loss dict and optional masks
+        loss_dict = dict()
+        map_all_loss_gt_mask = None
 
-        if not self.only_finetune_diffusion:
+        if not self.freeze_transformer:
             map_gt_vecs_list = copy.deepcopy(map_gt_bboxes_list)
 
             all_cls_scores = preds_dicts['all_cls_scores']
@@ -3338,7 +3364,6 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
                 
             l0_loss_map_cls_all, l0_loss_map_pts_all, l0_loss_map_dir_all = self.map_loss_single(map_pre_cls_scores, map_pre_coord_preds, map_pre_pts_coord_preds, map_all_gt_bboxes_list[0], map_all_gt_labels_list[0],map_all_gt_shifts_pts_list[0], map_all_loss_gt_mask[0], map_all_gt_bboxes_ignore_list[0])
             
-            loss_dict = dict()
             # loss from the last decoder layer
             loss_dict['loss_cls'] = losses_cls[-1]
             loss_dict['loss_bbox'] = losses_bbox[-1]
@@ -3348,22 +3373,6 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             loss_dict['loss_map_pts'] = map_losses_pts[-1]
             loss_dict['loss_map_dir'] = map_losses_dir[-1]
 
-            # Drivable area supervision (optional)
-            map_drivable_logits = preds_dicts.get('map_drivable_logits', None)
-            map_reference_points = preds_dicts.get('map_reference_points', None)
-            if drivable_area_map is not None and map_drivable_logits is not None and map_reference_points is not None:
-                # use the last decoder layer logits
-                drivable_logits = map_drivable_logits[-1].squeeze(-1)  # [B, N_map_query]
-                with torch.no_grad():
-                    drivable_mask, valid_mask = self.query_drivable_area_for_map_anchors(
-                        map_reference_points, drivable_area_map, return_valid_mask=True)
-                weight_mask = valid_mask.float()
-                # ignore samples without gt map (mask==0)
-                if map_all_loss_gt_mask is not None:
-                    weight_mask = weight_mask * map_all_loss_gt_mask[-1].unsqueeze(-1)
-                bce = self.loss_drivable_area(drivable_logits, drivable_mask.float())
-                normalizer = weight_mask.sum().clamp(min=1.0)
-                loss_dict['loss_map_drivable'] = (bce * weight_mask).sum() / normalizer
 
             # Planning Loss
             ego_fut_gt_fix_time = ego_fut_gt_fix_time.squeeze(1)
@@ -3413,8 +3422,27 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
                 loss_dict[f'd{num_dec_layer}.loss_map_dir'] = map_loss_dir_i
                 num_dec_layer += 1
         
+        
+        # Drivable area supervision
+        if self.use_map_drivable_supervision:
+            # Drivable area supervision (optional)
+            map_drivable_logits = preds_dicts.get('map_drivable_logits', None)
+            map_reference_points = preds_dicts.get('map_reference_points', None)
+            if drivable_area_map is not None and map_drivable_logits is not None and map_reference_points is not None:
+                # use the last decoder layer logits
+                drivable_logits = map_drivable_logits[-1].squeeze(-1)  # [B, N_map_query]
+                with torch.no_grad():
+                    drivable_mask, valid_mask = self.query_drivable_area_for_map_anchors(
+                        map_reference_points, drivable_area_map, return_valid_mask=True)
+                weight_mask = valid_mask.float()
+                # ignore samples without gt map (mask==0)
+                if map_all_loss_gt_mask is not None:
+                    weight_mask = weight_mask * map_all_loss_gt_mask[-1].unsqueeze(-1)
+                bce = self.loss_drivable_area(drivable_logits, drivable_mask.float())
+                loss_dict['loss_map_drivable'] = (bce * weight_mask).sum() * 0.01
+
         # Diffusion Loss on intermediate queries
-        if self.use_diffusion_loss:
+        if self.finetune_diffusion:
             intermediate_agent_query = preds_dicts.get('intermediate_agent_query', None)
             intermediate_map_query = preds_dicts.get('intermediate_map_query', None)
             intermediate_ego_query = preds_dicts.get('intermediate_ego_query', None)
@@ -3431,7 +3459,6 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
                 topk_agent=5,  # Use top 5 agent tokens (vs 100 total)
                 topk_map=5     # Use top 5 map tokens (vs 100 total)
             )
-            loss_dict = dict()
             if loss_diffusion is not None:
                 loss_dict['loss_diffusion'] = loss_diffusion
         
