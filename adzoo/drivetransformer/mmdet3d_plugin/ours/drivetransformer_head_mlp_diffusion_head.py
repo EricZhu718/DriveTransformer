@@ -607,6 +607,110 @@ class DiffusionHead(nn.Module):
         return predicted_noises
     
 
+class DrivableAreaHead(nn.Module):
+    """Predict drivable-area logits using map token features plus shared map heads' hidden features."""
+
+    def __init__(self, embed_dims, num_layers, num_cls_fcs=2, init_fn=None):
+        super().__init__()
+        self.token_proj = nn.ModuleList([nn.Linear(embed_dims, embed_dims) for _ in range(num_layers)])
+        self.cls_hidden_proj = nn.ModuleList([nn.Linear(embed_dims, embed_dims) for _ in range(num_layers)])
+        self.reg_hidden_proj = nn.ModuleList([nn.Linear(embed_dims, embed_dims) for _ in range(num_layers)])
+        self.pos_proj = nn.ModuleList([nn.Linear(embed_dims, embed_dims) for _ in range(num_layers)])
+
+        self.branches = nn.ModuleList()
+        for _ in range(num_layers):
+            branch = [nn.LayerNorm(embed_dims)]
+            for _ in range(num_cls_fcs):
+                branch.append(nn.Linear(embed_dims, embed_dims))
+                branch.append(nn.SiLU(inplace=True))
+            branch.append(nn.Linear(embed_dims, 1, bias=False))
+            self.branches.append(nn.Sequential(*branch))
+
+        if init_fn is not None:
+            self.apply(init_fn)
+
+    def _extract_last_hidden_linear(self, branch, x):
+        """Return the output right after the last hidden Linear, before its activation."""
+        if isinstance(branch, nn.Sequential):
+            last_linear_out = None
+            for idx, module in enumerate(branch):
+                if idx == len(branch) - 1:
+                    break  # skip the final prediction layer
+                x = module(x)
+                if isinstance(module, nn.Linear):
+                    last_linear_out = x
+            return last_linear_out if last_linear_out is not None else x
+
+        # Fallback for non-sequential branches (e.g., a single Linear)
+        return branch(x)
+
+    def forward(self, intermediate_map_query, map_cls_branches, map_reg_branches, map_reference_points, map_ref_embedding):
+        """Compute drivable logits for each decoder layer.
+
+        Args:
+            intermediate_map_query: [N_layers, B, N_map_query, D] (includes initial).
+            map_cls_branches: ModuleList of map classification heads.
+            map_reg_branches: ModuleList of map regression heads.
+            map_reference_points: [B, N_map_query, 2].
+            map_ref_embedding: module to encode positions (shared with main head).
+        Returns:
+            Tensor or None: [N_layers, B, N_map_query, 1] stacked logits, or None.
+        """
+        if intermediate_map_query is None or map_reference_points is None:
+            return None
+
+        # Basic shape assertions
+        assert intermediate_map_query.dim() == 4, \
+            f"intermediate_map_query should be [L+1, B, N_map, D], got {intermediate_map_query.shape}"
+        assert map_reference_points.dim() == 3 and map_reference_points.shape[-1] == 2, \
+            f"map_reference_points should be [B, N_map, 2], got {map_reference_points.shape}"
+        assert intermediate_map_query.shape[2] == map_reference_points.shape[1], \
+            f"query count mismatch: intermediate_map_query N={intermediate_map_query.shape[2]} vs map_reference_points N={map_reference_points.shape[1]}"
+
+        num_ctx = intermediate_map_query.shape[0]
+        num_heads = len(self.branches)
+        num_cls_heads = len(map_cls_branches)
+        num_reg_heads = len(map_reg_branches)
+
+        assert num_ctx == num_heads, \
+            f"Layer count mismatch: intermediate_map_query L+1={num_ctx} vs drivable branches={num_heads}"
+        assert num_cls_heads == num_heads and num_reg_heads == num_heads, \
+            f"Branch clones mismatch: cls={num_cls_heads}, reg={num_reg_heads}, expected {num_heads}"
+
+        embed_dim = intermediate_map_query.shape[-1]
+        assert self.token_proj[0].in_features == embed_dim and self.cls_hidden_proj[0].in_features == embed_dim and \
+               self.reg_hidden_proj[0].in_features == embed_dim and self.pos_proj[0].in_features == embed_dim, \
+               f"Embed dim mismatch: expected {embed_dim} for projections"
+
+        num_layers = num_heads
+        map_pe = map_ref_embedding(pos2posemb(map_reference_points, embed_dim // 2))
+        assert map_pe.shape[:2] == (intermediate_map_query.shape[1], intermediate_map_query.shape[2]) and map_pe.shape[-1] == embed_dim, \
+            f"Position embedding shape mismatch: got {map_pe.shape}, expected [B, N_map, D={embed_dim}]"
+
+        logits = []
+        for layer_idx in range(num_layers):
+            # Align indices: intermediate queries have L+1 (initial + L layers),
+            # while transformer layers are L. The initial state uses the last branch (-1).
+            branch_idx = (num_cls_heads - 1) if layer_idx == 0 else (layer_idx - 1)
+            assert 0 <= branch_idx < num_cls_heads and 0 <= branch_idx < num_reg_heads, \
+                f"Computed branch_idx {branch_idx} out of bounds for layer {layer_idx} with heads cls={num_cls_heads}, reg={num_reg_heads}"
+
+            token_feat = self.token_proj[layer_idx](intermediate_map_query[layer_idx])
+            cls_hidden = self._extract_last_hidden_linear(
+                map_cls_branches[branch_idx], intermediate_map_query[layer_idx]
+            )
+            reg_hidden = self._extract_last_hidden_linear(
+                map_reg_branches[branch_idx], intermediate_map_query[layer_idx] + map_pe
+            )
+            cls_feat = self.cls_hidden_proj[layer_idx](cls_hidden)
+            reg_feat = self.reg_hidden_proj[layer_idx](reg_hidden)
+            pos_feat = self.pos_proj[layer_idx](map_pe)
+            fused = token_feat + cls_feat + reg_feat + pos_feat
+            logits.append(self.branches[layer_idx](fused))
+
+        return torch.stack(logits, dim=0)
+
+
 @HEADS.register_module()
 class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
     """
@@ -842,6 +946,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         self.loss_map_cls = build_loss(loss_map_cls)
         self.loss_map_pts = build_loss(loss_map_pts)
         self.loss_map_dir = build_loss(loss_map_dir)
+        self.loss_drivable_area = nn.BCEWithLogitsLoss(reduction='none')
         self.map_bg_cls_weight = 0
         map_class_weight = loss_map_cls.get('class_weight', None)
         if map_class_weight is not None:
@@ -1085,6 +1190,12 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         self.map_cls_branches = _get_clones(map_cls_branch, map_num_pred)
         self.map_reg_branches = _get_clones(map_reg_branch, map_num_pred)
         self.map_reg_branches[-1] = nn.Linear(self.embed_dims, self.map_code_size * self.map_num_pts_per_vec)
+        self.drivable_area_head = DrivableAreaHead(
+            embed_dims=self.embed_dims,
+            num_layers=map_num_pred,
+            num_cls_fcs=self.num_cls_fcs,
+            init_fn=self.xavier_uniform_linear
+        )
         self.ego_traj_branches_fix_dist = _get_clones(ego_traj_branch_fix_dist, ego_num_pred) if self.fut_ego_fix_dist else None
         self.ego_traj_branches_fix_time = _get_clones(ego_traj_branch_fix_time, ego_num_pred)
         self.ego_traj_cls_branches = _get_clones(ego_traj_cls_branch, ego_num_pred) if self.ego_multi_modal else None
@@ -1126,6 +1237,8 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             for param in self.map_cls_branches.parameters():
                 param.requires_grad = False
             for param in self.map_reg_branches.parameters():
+                param.requires_grad = False
+            for param in self.drivable_area_head.parameters():
                 param.requires_grad = False
             for param in self.ego_traj_branches_fix_time.parameters():
                 param.requires_grad = False
@@ -1205,7 +1318,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             self.map_reference_points.weight[..., 1] = y.flatten()
         nn.init.constant_(self.map_query.weight, 0)
 
-    def query_drivable_area_for_map_anchors(self, map_reference_points, drivable_area_map):
+    def query_drivable_area_for_map_anchors(self, map_reference_points, drivable_area_map, return_valid_mask=False):
         """
         Query drivable area at map anchor/reference point locations (vectorized).
         
@@ -1217,6 +1330,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             
         Returns:
             drivable_mask: Tensor of shape [B, num_map_queries] with boolean drivability at each anchor
+            valid_mask (optional): Tensor of shape [B, num_map_queries] indicating anchors that fall inside the map
             
         Note:
             - Map reference points are in pc_range: x ∈ [-15, 15], y ∈ [-30, 30]
@@ -1270,7 +1384,10 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         
         # Only mark as drivable if within bounds AND actually drivable
         drivable_mask = valid & drivable_values
-        
+
+        if return_valid_mask:
+            return drivable_mask, valid
+
         return drivable_mask
 
     @force_fp32()
@@ -1539,6 +1656,18 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         ego_traj_fix_time, ego_traj_fix_dist, ego_traj_cls, intermediate_agent_query, intermediate_map_query, intermediate_ego_query = \
             list(map(lambda x: torch.stack(x) if not (x is None or x[0] is None) else None, results))
         map_boxes, map_refs = map_transform_box(map_pts_coords)
+
+        # Drivable area logits for each decoder stage (including initial state)
+        map_drivable_logits = None
+        if intermediate_map_query is not None:
+            map_drivable_logits = self.drivable_area_head(
+                intermediate_map_query,
+                self.map_cls_branches,
+                self.map_reg_branches,
+                map_reference_points,
+                self.map_ref_embedding
+            )
+
         # add current feature to memory
         self.post_update_memory(data, rec_ego_pose, agent_class, agent_coords, \
                                 map_class, map_refs[..., :2], agent_query, map_query, ego_query)
@@ -1568,6 +1697,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             'map_pre_cls_scores': map_prep_class, # [B, N_map_query, N_map_type]
             'map_pre_coord_preds': map_prep_box, # [B, N_map_query, 4]
             'map_pre_pts_coord_preds': map_prep_pts_coord, # [B, N_map_query, N_pts_per_line, 2]
+            'map_drivable_logits': map_drivable_logits, # [N_layers, B, N_map_query, 1]
             'agent_pre_cls_scores': agent_prep_class, # [B, N_agent_query, N_object_type]
             'agent_pre_coord_preds': agent_prep_ref, # [B, N_agent_query, C_box]
             'intermediate_agent_query': intermediate_agent_query, # [N_layers+1, B, N_agent_query, D] (includes initial)
@@ -3078,6 +3208,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
              ego_fut_cmd,
              ego_fut_classes,
              gt_attr_labels,
+             drivable_area_map=None,
              gt_bboxes_ignore=None,
              map_gt_bboxes_ignore=None,
              img_metas=None):
@@ -3216,6 +3347,23 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             loss_dict['loss_map_cls'] = map_losses_cls[-1]
             loss_dict['loss_map_pts'] = map_losses_pts[-1]
             loss_dict['loss_map_dir'] = map_losses_dir[-1]
+
+            # Drivable area supervision (optional)
+            map_drivable_logits = preds_dicts.get('map_drivable_logits', None)
+            map_reference_points = preds_dicts.get('map_reference_points', None)
+            if drivable_area_map is not None and map_drivable_logits is not None and map_reference_points is not None:
+                # use the last decoder layer logits
+                drivable_logits = map_drivable_logits[-1].squeeze(-1)  # [B, N_map_query]
+                with torch.no_grad():
+                    drivable_mask, valid_mask = self.query_drivable_area_for_map_anchors(
+                        map_reference_points, drivable_area_map, return_valid_mask=True)
+                weight_mask = valid_mask.float()
+                # ignore samples without gt map (mask==0)
+                if map_all_loss_gt_mask is not None:
+                    weight_mask = weight_mask * map_all_loss_gt_mask[-1].unsqueeze(-1)
+                bce = self.loss_drivable_area(drivable_logits, drivable_mask.float())
+                normalizer = weight_mask.sum().clamp(min=1.0)
+                loss_dict['loss_map_drivable'] = (bce * weight_mask).sum() / normalizer
 
             # Planning Loss
             ego_fut_gt_fix_time = ego_fut_gt_fix_time.squeeze(1)
