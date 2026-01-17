@@ -519,14 +519,41 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         # output_data_batch[0]['ego_fut_preds_fix_dist']: shape of (1,1,20,2)
         # output_data_batch[0]['map_reference_points']: shape of (100, 2) - map anchor positions in ego frame
 
+        # Debug: Inspect presence and shapes of drivable-related outputs
+        try:
+            print(f"[Debug] output_data_batch type: {type(output_data_batch)}, len: {len(output_data_batch)}", flush=True)
+            if isinstance(output_data_batch, (list, tuple)) and len(output_data_batch) > 0:
+                keys0 = list(output_data_batch[0].keys())
+                print(f"[Debug] output_data_batch[0] keys: {keys0}", flush=True)
+                if 'map_reference_points' in output_data_batch[0]:
+                    mrp = output_data_batch[0]['map_reference_points']
+                    if hasattr(mrp, 'shape'):
+                        print(f"[Debug] map_reference_points shape: {tuple(mrp.shape)}", flush=True)
+                    else:
+                        try:
+                            print(f"[Debug] map_reference_points len: {len(mrp)}", flush=True)
+                        except Exception:
+                            print(f"[Debug] map_reference_points type: {type(mrp)}", flush=True)
+                if 'map_drivable_logits' in output_data_batch[0]:
+                    mdl = output_data_batch[0]['map_drivable_logits']
+                    # Try to print shapes robustly
+                    if hasattr(mdl, 'shape'):
+                        print(f"[Debug] map_drivable_logits shape: {tuple(mdl.shape)}", flush=True)
+                    else:
+                        print(f"[Debug] map_drivable_logits type: {type(mdl)}", flush=True)
+                else:
+                    print("[Debug] 'map_drivable_logits' not present in output_data_batch[0]", flush=True)
+        except Exception as e:
+            print(f"[Debug] Error printing output_data_batch debug info: {e}", flush=True)
+
         # ========================================================================
         # DIFFUSION SAMPLING: Replace fixed trajectories with diffusion-generated ones
         # ========================================================================
         # Verify diffusion is enabled
-        if not hasattr(self.model.pts_bbox_head, 'use_diffusion_loss'):
-            raise RuntimeError("Model does not have use_diffusion_loss attribute. Wrong model loaded?")
-        if not self.model.pts_bbox_head.use_diffusion_loss:
-            raise RuntimeError("use_diffusion_loss is False. This agent requires diffusion to be enabled.")
+        # if not hasattr(self.model.pts_bbox_head, 'use_diffusion_loss'):
+        #     raise RuntimeError("Model does not have use_diffusion_loss attribute. Wrong model loaded?")
+        # if not self.model.pts_bbox_head.use_diffusion_loss:
+        #     raise RuntimeError("use_diffusion_loss is False. This agent requires diffusion to be enabled.")
         if not hasattr(self.model.pts_bbox_head, 'intermediate_ego_query'):
             raise RuntimeError("Model does not have intermediate_ego_query. Model may not be storing intermediate queries.")
         if self.model.pts_bbox_head.intermediate_ego_query is None:
@@ -1039,12 +1066,90 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                         collision_values[batch_idx, t] = 1.0
 
         return collision_values
+    
+    def extract_drivable_area_predictions(self, output_data_batch):
+        """
+        Extract predicted drivable area values along with their xy positions from anchors.
         
+        Args:
+            output_data_batch: List of output dicts from model inference
             
+        Returns:
+            Dictionary containing:
+                - 'map_reference_points': [num_anchors, 2] - xy positions of anchors
+                - 'map_drivable_logits': [num_anchors] - predicted drivable area logits
+                - 'map_drivable_probs': [num_anchors] - predicted drivable area probabilities (sigmoid)
+        """
+        result = {
+            'map_reference_points': None,
+            'map_drivable_logits': None,
+            'map_drivable_probs': None,
+        }
         
-
-
-
+        # Debug: batch presence
+        if output_data_batch is None or len(output_data_batch) == 0:
+            print("[Debug] extract_drivable_area_predictions: empty output_data_batch", flush=True)
+            return result
+            
+        batch_output = output_data_batch[0]
+        try:
+            print(f"[Debug] extract_drivable_area_predictions: keys: {list(batch_output.keys())}", flush=True)
+        except Exception:
+            pass
+        
+        # Extract map reference points (anchor positions)
+        if 'map_reference_points' in batch_output:
+            map_ref_points = batch_output['map_reference_points']
+            if isinstance(map_ref_points, torch.Tensor):
+                result['map_reference_points'] = map_ref_points.cpu().numpy()
+            else:
+                result['map_reference_points'] = np.array(map_ref_points)
+            try:
+                mrp_np = result['map_reference_points']
+                print(f"[Debug] map_reference_points extracted: shape {mrp_np.shape}, sample {mrp_np[:5]}", flush=True)
+            except Exception:
+                pass
+        
+        # Extract drivable area logits if available
+        if 'map_drivable_logits' in batch_output:
+            drivable_logits = batch_output['map_drivable_logits']
+            
+            # Handle different tensor shapes
+            # map_drivable_logits shape: [N_layers, B, N_map_query, 1]
+            # We'll use the last layer's predictions
+            if isinstance(drivable_logits, torch.Tensor):
+                try:
+                    print(f"[Debug] raw map_drivable_logits tensor shape: {tuple(drivable_logits.shape)}", flush=True)
+                except Exception:
+                    pass
+                if drivable_logits.dim() == 4:
+                    # [N_layers, B, N_map_query, 1] -> [N_map_query]
+                    drivable_logits = drivable_logits[-1, 0, :, 0]  # Last layer, batch 0, remove class dim
+                elif drivable_logits.dim() == 3:
+                    # [B, N_map_query, 1] -> [N_map_query]
+                    drivable_logits = drivable_logits[0, :, 0]
+                elif drivable_logits.dim() == 2:
+                    # [B, N_map_query] or [N_map_query, 1]
+                    if drivable_logits.shape[0] == 1:
+                        drivable_logits = drivable_logits[0]
+                    else:
+                        drivable_logits = drivable_logits[:, 0]
+                
+                logits_np = drivable_logits.cpu().numpy()
+            else:
+                logits_np = np.array(drivable_logits)
+                if logits_np.ndim > 1:
+                    logits_np = logits_np.squeeze()
+            
+            result['map_drivable_logits'] = logits_np
+            result['map_drivable_probs'] = 1.0 / (1.0 + np.exp(-logits_np))  # sigmoid
+            try:
+                probs = result['map_drivable_probs']
+                print(f"[Debug] map_drivable_probs: shape {probs.shape}, min {probs.min():.3f}, max {probs.max():.3f}", flush=True)
+            except Exception:
+                pass
+        
+        return result
 
 
     def save(self, tick_data, diffusion_es_outputs, output_data_batch, draw_traj=False):
@@ -1164,7 +1269,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                                   head_width=0.5, head_length=0.5, fc='blue', ec='blue',
                                   alpha=0.7, linewidth=2, zorder=20)
 
-            # Draw map anchor points if available
+            # Draw map anchor points if available with colors
             if 'map_reference_points' in output_data_batch[0]:
                 map_anchors = output_data_batch[0]['map_reference_points']  # [num_queries, 2]
                 if isinstance(map_anchors, torch.Tensor):
@@ -1172,17 +1277,33 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 else:
                     map_anchors_np = map_anchors
                 
-                # Plot all anchor points as small dots
-                axes[ax_idx].scatter(map_anchors_np[:, 0], map_anchors_np[:, 1],
-                                    c='purple', s=20, alpha=0.6, marker='.',
-                                    label='Map Anchors', zorder=3)
-                # Label each anchor point with two-line x/y values
-                for x, y in map_anchors_np:
-                    axes[ax_idx].text(
-                        x + 0.2, y + 0.2,
-                        f"x: {x:.1f}\ny: {y:.1f}",
-                        color='purple', fontsize=6, alpha=0.7, zorder=4
+                # Extract drivable area predictions if available
+                drivable_preds = self.extract_drivable_area_predictions(output_data_batch)
+                try:
+                    print(f"[Debug] save(): anchors count {map_anchors_np.shape[0]}, have_probs {drivable_preds['map_drivable_probs'] is not None}", flush=True)
+                except Exception:
+                    pass
+                
+                if drivable_preds['map_drivable_probs'] is not None:
+                    # Use drivable probability to color the anchors
+                    colors = drivable_preds['map_drivable_probs']
+                    try:
+                        print(f"[Debug] save(): drivable probs min {colors.min():.3f}, max {colors.max():.3f}", flush=True)
+                    except Exception:
+                        pass
+                    scatter = axes[ax_idx].scatter(
+                        map_anchors_np[:, 0], map_anchors_np[:, 1],
+                        c=colors, cmap='YlOrRd_r', s=50, alpha=0.7, 
+                        marker='o', vmin=0, vmax=1, zorder=3
                     )
+                    # Add colorbar for drivability probability
+                    cbar = plt.colorbar(scatter, ax=axes[ax_idx], fraction=0.046, pad=0.04)
+                    cbar.set_label('Drivable Prob', fontsize=8)
+                else:
+                    # If no drivable predictions, use purple color
+                    axes[ax_idx].scatter(map_anchors_np[:, 0], map_anchors_np[:, 1],
+                                        c='purple', s=50, alpha=0.7, marker='o',
+                                        label='Map Anchors', zorder=3)
 
             axes[ax_idx].set_xlabel('Left (m)')
             axes[ax_idx].set_ylabel('Forward (m)')

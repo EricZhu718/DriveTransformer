@@ -3492,6 +3492,8 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         
         # Extract map_reference_points from preds_dicts
         map_reference_points = preds_dicts.get('map_reference_points', None)
+        # Extract drivable area logits (optional)
+        map_drivable_logits = preds_dicts.get('map_drivable_logits', None)
         
         ret_list = []
         for i in range(num_samples):
@@ -3517,8 +3519,19 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             # Extract map_reference_points for this sample
             map_ref_pts = map_reference_points[i] if map_reference_points is not None else None
             
+            # Extract last-layer drivable logits for this sample if available
+            if map_drivable_logits is not None:
+                try:
+                    drivable_logits_sample = map_drivable_logits[-1, i, :, 0]
+                except Exception:
+                    # Fallback for slightly different shapes
+                    dl_last = map_drivable_logits[-1]
+                    drivable_logits_sample = dl_last[i].squeeze(-1)
+            else:
+                drivable_logits_sample = None
+            
             ret_list.append([bboxes, scores, labels, trajs, map_bboxes,
-                             map_scores, map_labels, map_pts, map_ref_pts])
+                             map_scores, map_labels, map_pts, map_ref_pts, drivable_logits_sample])
 
         return ret_list
 

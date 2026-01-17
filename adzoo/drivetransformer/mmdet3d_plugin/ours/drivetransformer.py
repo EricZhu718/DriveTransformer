@@ -245,8 +245,15 @@ class DriveTransformer(MVXTwoStageDetector):
         outs = self.pts_bbox_head(img_feats, img_metas, ego_lcf_feat, ego_fut_cmd, ego_his_trajs, **data)
         bbox_list = self.pts_bbox_head.get_bboxes(outs, img_metas)
         bbox_results = []
-        for i, (bboxes, scores, labels, trajs, map_bboxes, \
-                map_scores, map_labels, map_pts, map_ref_pts) in enumerate(bbox_list):
+        for i, entry in enumerate(bbox_list):
+            # Support both old (9 elements) and new (10 elements with drivable logits) formats
+            if len(entry) >= 10:
+                bboxes, scores, labels, trajs, map_bboxes, \
+                map_scores, map_labels, map_pts, map_ref_pts, map_drivable_logits = entry[:10]
+            else:
+                bboxes, scores, labels, trajs, map_bboxes, \
+                map_scores, map_labels, map_pts, map_ref_pts = entry
+                map_drivable_logits = None
             bbox_result = bbox3d2result(bboxes, scores, labels)
             bbox_result['trajs_3d'] = trajs.cpu()
             map_bbox_result = dict(
@@ -265,6 +272,9 @@ class DriveTransformer(MVXTwoStageDetector):
                 bbox_result['agent_traj_cls_scores'] = outs['all_traj_cls_scores'][-1].cpu()
             if map_ref_pts is not None:
                 bbox_result['map_reference_points'] = map_ref_pts.cpu()
+            # Add drivable logits if available
+            if map_drivable_logits is not None:
+                bbox_result['map_drivable_logits'] = map_drivable_logits.cpu()
             bbox_results.append(bbox_result)
 
         return bbox_results
