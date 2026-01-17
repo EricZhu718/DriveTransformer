@@ -232,6 +232,9 @@ model = dict(
 
         ## Area Prediction
         finetune_drivable_area=True,
+        drivable_area_head_cfg=dict(
+            grid_size=3,
+        ),
 
         ## Freeze the main transformer
         freeze_transformer=True,
@@ -471,7 +474,7 @@ test_pipeline = [
 
 data = dict(
     samples_per_gpu=batch_size,
-    workers_per_gpu=3,  # Reduced from 12 to avoid memory spike (each worker copies ~7GB map_infos)
+    workers_per_gpu=1,  # Reduced from 12 to avoid memory spike (each worker copies ~7GB map_infos)
     train = dict(
         type = dataset_type,
         data_root=data_root,

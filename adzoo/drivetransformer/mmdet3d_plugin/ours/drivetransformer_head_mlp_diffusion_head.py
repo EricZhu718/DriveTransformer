@@ -608,10 +608,65 @@ class DiffusionHead(nn.Module):
     
 
 class DrivableAreaHead(nn.Module):
-    """Predict drivable-area logits using map token features plus shared map heads' hidden features."""
+    """Predict drivable-area logits using map token features plus shared map heads' hidden features.
+    
+    Outputs an n×n grid of logits for each map query token, where n is odd (e.g., 3, 5, 7).
+    This provides spatial context around each query point by sampling intermediate positions.
+    Grid spacing is determined by the anchor spacing to ensure equidistant samples.
+    """
 
-    def __init__(self, embed_dims, num_layers, num_cls_fcs=2, init_fn=None):
+    def __init__(self, embed_dims, num_layers, num_cls_fcs=2, grid_size=3, 
+                 pc_range=None, num_map_queries=100, init_fn=None):
         super().__init__()
+        assert grid_size % 2 == 1, f"grid_size must be odd, got {grid_size}"
+        assert grid_size >= 1, f"grid_size must be >= 1, got {grid_size}"
+        
+        self.grid_size = grid_size
+        self.num_outputs = grid_size * grid_size
+        
+        # Calculate anchor spacing based on how map reference points are initialized
+        # Map anchors form a uniform grid: sqrt(num_queries) × sqrt(num_queries)
+        # distributed across pc_range using torch.linspace
+        if pc_range is None:
+            pc_range = [-15, -30, -8.0, 15, 30, 8.0]  # default from comments
+        
+        num_anchors_per_dim = int(np.sqrt(num_map_queries))
+        x_min, y_min = pc_range[0], pc_range[1]
+        x_max, y_max = pc_range[3], pc_range[4]
+        
+        # Spacing between anchors (same as torch.linspace spacing)
+        # For linspace with N points: spacing = (max - min) / (N - 1)
+        anchor_spacing_x = (x_max - x_min) / (num_anchors_per_dim - 1) if num_anchors_per_dim > 1 else 1.0
+        anchor_spacing_y = (y_max - y_min) / (num_anchors_per_dim - 1) if num_anchors_per_dim > 1 else 1.0
+        
+        # we want to evenly space them
+        grid_spacing_x = anchor_spacing_x / grid_size
+        grid_spacing_y = anchor_spacing_y / grid_size
+        
+        # Pre-compute grid offsets (relative to anchor center)
+        # The center grid point will have offset (0, 0), placing it exactly at the anchor position
+        # For grid_size=3: offsets are [-spacing, 0, +spacing] in each dimension
+        # For grid_size=5: offsets are [-2*spacing, -spacing, 0, +spacing, +2*spacing], etc.
+        half_size = grid_size // 2
+        
+        # Create offsets such that center point is exactly at (0, 0)
+        # Using range from -half_size to +half_size (inclusive) with grid_size points
+        offsets_x = torch.arange(-half_size, half_size + 1, dtype=torch.float32) * grid_spacing_x
+        offsets_y = torch.arange(-half_size, half_size + 1, dtype=torch.float32) * grid_spacing_y
+        
+        # Create 2D grid: [grid_size, grid_size, 2] with (x, y) offsets
+        # Center point at [half_size, half_size] will have offset (0, 0)
+        grid_y, grid_x = torch.meshgrid(offsets_y, offsets_x, indexing='ij')
+        grid_offsets = torch.stack([grid_x, grid_y], dim=-1)  # [grid_size, grid_size, 2]
+        
+        self.register_buffer('grid_offsets', grid_offsets)
+        
+        # Store for reference
+        self.anchor_spacing_x = anchor_spacing_x
+        self.anchor_spacing_y = anchor_spacing_y
+        self.grid_spacing_x = grid_spacing_x
+        self.grid_spacing_y = grid_spacing_y
+        
         self.token_proj = nn.ModuleList([nn.Linear(embed_dims, embed_dims) for _ in range(num_layers)])
         self.cls_hidden_proj = nn.ModuleList([nn.Linear(embed_dims, embed_dims) for _ in range(num_layers)])
         self.reg_hidden_proj = nn.ModuleList([nn.Linear(embed_dims, embed_dims) for _ in range(num_layers)])
@@ -623,11 +678,53 @@ class DrivableAreaHead(nn.Module):
             for _ in range(num_cls_fcs):
                 branch.append(nn.Linear(embed_dims, embed_dims))
                 branch.append(nn.SiLU(inplace=True))
-            branch.append(nn.Linear(embed_dims, 1, bias=False))
+            # Output n×n grid instead of single value
+            branch.append(nn.Linear(embed_dims, self.num_outputs, bias=False))
             self.branches.append(nn.Sequential(*branch))
 
         if init_fn is not None:
             self.apply(init_fn)
+
+        # Initialize weights with small final layer outputs for stable training
+        # This must be called AFTER init_fn to avoid being overwritten
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights with small final layer outputs for stable training."""
+        # Scale down the final output layer of each branch
+        # This is important for drivable area prediction to start with small logits
+        for branch in self.branches:
+            # The last layer in each branch is the output layer (predicts grid logits)
+            final_layer = branch[-1]
+            if isinstance(final_layer, nn.Linear):
+                # Scale weights down by 0.01 for small initial predictions
+                nn.init.xavier_uniform_(final_layer.weight)
+                final_layer.weight.data *= 0.01
+                if final_layer.bias is not None:
+                    nn.init.constant_(final_layer.bias, 0)
+
+    
+    def get_sampled_positions(self, map_reference_points):
+        """Compute actual spatial positions of grid samples around each anchor.
+        
+        Args:
+            map_reference_points: [B, N_map_query, 2] anchor positions in ego frame
+            
+        Returns:
+            sampled_positions: [B, N_map_query, grid_size, grid_size, 2] actual (x, y) positions
+        """
+        B, N, _ = map_reference_points.shape
+        
+        # Expand anchors: [B, N, 1, 1, 2]
+        anchors = map_reference_points.unsqueeze(2).unsqueeze(3)
+        
+        # Expand offsets: [1, 1, grid_size, grid_size, 2]
+        offsets = self.grid_offsets.unsqueeze(0).unsqueeze(0)
+        
+        # Add offsets to anchors: [B, N, grid_size, grid_size, 2]
+        sampled_positions = anchors + offsets
+        
+        return sampled_positions
 
     def _extract_last_hidden_linear(self, branch, x):
         """Return the output right after the last hidden FC layer, before activations and final prediction.
@@ -667,7 +764,9 @@ class DrivableAreaHead(nn.Module):
             map_reference_points: [B, N_map_query, 2].
             map_ref_embedding: module to encode positions (shared with main head).
         Returns:
-            Tensor or None: [N_layers, B, N_map_query, 1] stacked logits, or None.
+            dict with:
+                - 'logits': [N_layers, B, N_map_query, grid_size, grid_size] prediction logits
+                - 'sampled_positions': [B, N_map_query, grid_size, grid_size, 2] spatial positions of samples
         """
         if intermediate_map_query is None or map_reference_points is None:
             return None
@@ -700,6 +799,9 @@ class DrivableAreaHead(nn.Module):
         assert map_pe.shape[:2] == (intermediate_map_query.shape[1], intermediate_map_query.shape[2]) and map_pe.shape[-1] == embed_dim, \
             f"Position embedding shape mismatch: got {map_pe.shape}, expected [B, N_map, D={embed_dim}]"
 
+        # Compute sampled positions for all grid points
+        sampled_positions = self.get_sampled_positions(map_reference_points)
+        
         logits = []
         for layer_idx in range(num_layers):
             # Align indices: intermediate queries have L+1 (initial + L layers),
@@ -719,9 +821,29 @@ class DrivableAreaHead(nn.Module):
             reg_feat = self.reg_hidden_proj[layer_idx](reg_hidden)
             pos_feat = self.pos_proj[layer_idx](map_pe)
             fused = token_feat + cls_feat + reg_feat + pos_feat
-            logits.append(self.branches[layer_idx](fused))
+            # Output: [B, N_map_query, grid_size * grid_size]
+            logit_flat = self.branches[layer_idx](fused)
+            # Reshape to [B, N_map_query, grid_size, grid_size]
+            logit_grid = logit_flat.view(logit_flat.shape[0], logit_flat.shape[1], self.grid_size, self.grid_size)
+            logits.append(logit_grid)
 
-        return torch.stack(logits, dim=0)
+        # Stack to [N_layers, B, N_map_query, grid_size, grid_size]
+        logits_stacked = torch.stack(logits, dim=0)
+        
+        # Compute accumulated logits for iterative refinement
+        num_layers = logits_stacked.shape[0]
+        accumulated_logits = []
+        accum = torch.zeros_like(logits_stacked[0])
+        for layer_idx in range(num_layers):
+            accum = accum + logits_stacked[layer_idx]
+            accumulated_logits.append(accum.clone())
+        accumulated_logits_stacked = torch.stack(accumulated_logits, dim=0)
+        
+        return {
+            'logits': logits_stacked,
+            'accumulated_logits': accumulated_logits_stacked,
+            'sampled_positions': sampled_positions
+        }
 
 
 @HEADS.register_module()
@@ -817,6 +939,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         fut_ego_fix_dist=False,
         ## Finetune toggles
         finetune_drivable_area=False,
+        drivable_area_head_cfg=None,
     ):
     
         super().__init__()
@@ -961,7 +1084,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         self.loss_map_cls = build_loss(loss_map_cls)
         self.loss_map_pts = build_loss(loss_map_pts)
         self.loss_map_dir = build_loss(loss_map_dir)
-        self.loss_drivable_area = nn.BCEWithLogitsLoss(reduction='none')
+        self.loss_drivable_area = nn.BCEWithLogitsLoss(reduction='mean')
         self.map_bg_cls_weight = 0
         map_class_weight = loss_map_cls.get('class_weight', None)
         if map_class_weight is not None:
@@ -990,6 +1113,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         self.finetune_diffusion = finetune_diffusion
         self.freeze_transformer = freeze_transformer
         self.finetune_drivable_area = finetune_drivable_area
+        self.drivable_area_head_cfg = drivable_area_head_cfg
         # Use drivable area supervision when finetuning drivable-area head
         self.use_map_drivable_supervision = finetune_drivable_area
         self.diffusion_loss_weight = diffusion_loss_weight
@@ -1213,10 +1337,18 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         self.map_cls_branches = _get_clones(map_cls_branch, map_num_pred)
         self.map_reg_branches = _get_clones(map_reg_branch, map_num_pred)
         self.map_reg_branches[-1] = nn.Linear(self.embed_dims, self.map_code_size * self.map_num_pts_per_vec)
+        
+        # Extract drivable area head config
+        drivable_area_cfg = self.drivable_area_head_cfg or {}
+        grid_size = drivable_area_cfg.get('grid_size', 3)
+        
         self.drivable_area_head = DrivableAreaHead(
             embed_dims=self.embed_dims,
             num_layers=map_num_pred,
             num_cls_fcs=self.num_cls_fcs,
+            grid_size=grid_size,  # Configurable grid size (default 3×3)
+            pc_range=self.bbox_coder.pc_range,  # Pass pc_range to compute anchor spacing
+            num_map_queries=self.map_num_query,  # Pass num queries to compute grid layout
             init_fn=self.xavier_uniform_linear
         )
         self.ego_traj_branches_fix_dist = _get_clones(ego_traj_branch_fix_dist, ego_num_pred) if self.fut_ego_fix_dist else None
@@ -1681,14 +1813,20 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
 
         # Drivable area logits for each decoder stage (including initial state)
         map_drivable_logits = None
+        map_drivable_accumulated_logits = None
+        map_drivable_sampled_positions = None
         if intermediate_map_query is not None and self.finetune_drivable_area:
-            map_drivable_logits = self.drivable_area_head(
+            drivable_output = self.drivable_area_head(
                 intermediate_map_query,
                 self.map_cls_branches,
                 self.map_reg_branches,
                 map_reference_points,
                 self.map_ref_embedding
             )
+            if drivable_output is not None:
+                map_drivable_logits = drivable_output['logits']
+                map_drivable_accumulated_logits = drivable_output['accumulated_logits']
+                map_drivable_sampled_positions = drivable_output['sampled_positions']
 
         # add current feature to memory
         self.post_update_memory(data, rec_ego_pose, agent_class, agent_coords, \
@@ -1719,7 +1857,9 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             'map_pre_cls_scores': map_prep_class, # [B, N_map_query, N_map_type]
             'map_pre_coord_preds': map_prep_box, # [B, N_map_query, 4]
             'map_pre_pts_coord_preds': map_prep_pts_coord, # [B, N_map_query, N_pts_per_line, 2]
-            'map_drivable_logits': map_drivable_logits, # [N_layers, B, N_map_query, 1]
+            'map_drivable_logits': map_drivable_logits, # [N_layers, B, N_map_query, grid_size, grid_size]
+            'map_drivable_accumulated_logits': map_drivable_accumulated_logits, # [N_layers, B, N_map_query, grid_size, grid_size] (accumulated sum)
+            'map_drivable_sampled_positions': map_drivable_sampled_positions, # [B, N_map_query, grid_size, grid_size, 2]
             'agent_pre_cls_scores': agent_prep_class, # [B, N_agent_query, N_object_type]
             'agent_pre_coord_preds': agent_prep_ref, # [B, N_agent_query, C_box]
             'intermediate_agent_query': intermediate_agent_query, # [N_layers+1, B, N_agent_query, D] (includes initial)
@@ -3427,19 +3567,52 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
         if self.use_map_drivable_supervision:
             # Drivable area supervision (optional)
             map_drivable_logits = preds_dicts.get('map_drivable_logits', None)
+            map_drivable_accumulated_logits = preds_dicts.get('map_drivable_accumulated_logits', None)
+            map_drivable_sampled_positions = preds_dicts.get('map_drivable_sampled_positions', None)
             map_reference_points = preds_dicts.get('map_reference_points', None)
-            if drivable_area_map is not None and map_drivable_logits is not None and map_reference_points is not None:
-                # use the last decoder layer logits
-                drivable_logits = map_drivable_logits[-1].squeeze(-1)  # [B, N_map_query]
+            if drivable_area_map is not None and map_drivable_accumulated_logits is not None and map_drivable_sampled_positions is not None:
+                # map_drivable_accumulated_logits shape: [N_layers, B, N_map_query, grid_size, grid_size]
+                num_layers = map_drivable_accumulated_logits.shape[0]
+                B, N, grid_h, grid_w = map_drivable_accumulated_logits.shape[1], map_drivable_accumulated_logits.shape[2], map_drivable_accumulated_logits.shape[3], map_drivable_accumulated_logits.shape[4]
+                
+                # Query ground truth drivable area at grid points (once, reuse for all layers)
+                # Use grid points directly instead of anchor-specific sampling
                 with torch.no_grad():
-                    drivable_mask, valid_mask = self.query_drivable_area_for_map_anchors(
-                        map_reference_points, drivable_area_map, return_valid_mask=True)
+                    # Create a regular grid of points
+                    # Grid points are at the actual sampled positions
+                    grid_points = map_drivable_sampled_positions  # [B, N_map_query, grid_h, grid_w, 2]
+                    
+                    # Flatten for batch querying: [B, N*grid_h*grid_w, 2]
+                    grid_points_flat = grid_points.view(B, N * grid_h * grid_w, 2)
+                    
+                    # Query drivable area for all grid points
+                    drivable_mask_flat, valid_mask_flat = self.query_drivable_area_for_map_anchors(
+                        grid_points_flat, drivable_area_map, return_valid_mask=True)
+                    
+                    # Reshape back to grid: [B, N, grid_h, grid_w]
+                    drivable_mask = drivable_mask_flat.view(B, N, grid_h, grid_w)
+                    valid_mask = valid_mask_flat.view(B, N, grid_h, grid_w)
+                
                 weight_mask = valid_mask.float()
-                # ignore samples without gt map (mask==0)
+                # Ignore samples without gt map (mask==0)
                 if map_all_loss_gt_mask is not None:
-                    weight_mask = weight_mask * map_all_loss_gt_mask[-1].unsqueeze(-1)
-                bce = self.loss_drivable_area(drivable_logits, drivable_mask.float())
-                loss_dict['loss_map_drivable'] = (bce * weight_mask).sum() * 0.01
+                    # Expand mask to cover all grid points: [B, N] -> [B, N, 1, 1] -> [B, N, grid_h, grid_w]
+                    weight_mask = weight_mask * map_all_loss_gt_mask[-1].unsqueeze(-1).unsqueeze(-1)
+                
+                # Use pre-computed accumulated logits for each layer
+                loss_map_drivable_list = []
+                
+                for layer_idx in range(num_layers):
+                    # Get accumulated logits for this layer
+                    accumulated_logits = map_drivable_accumulated_logits[layer_idx]
+                    
+                    # Compute BCE loss for accumulated logits
+                    bce = self.loss_drivable_area(accumulated_logits, drivable_mask.float())  # [B, N, grid_h, grid_w]
+                    layer_loss = (bce * weight_mask).mean()
+                    loss_map_drivable_list.append(layer_loss)
+                
+                # Average all layer losses into a single drivable area loss
+                loss_dict['loss_map_drivable'] = torch.stack(loss_map_drivable_list).mean()
 
         # Diffusion Loss on intermediate queries
         if self.finetune_diffusion:
@@ -3522,7 +3695,12 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             # Extract last-layer drivable logits for this sample if available
             if map_drivable_logits is not None:
                 try:
-                    drivable_logits_sample = map_drivable_logits[-1, i, :, 0]
+                    # map_drivable_logits shape: [N_layers, B, N_map_query, grid_size, grid_size]
+                    drivable_logits_grid = map_drivable_logits[-1, i]  # [N_map_query, grid_size, grid_size]
+                    # Take the center point of the grid (which corresponds to the anchor position)
+                    grid_size = drivable_logits_grid.shape[-1]
+                    center_idx = grid_size // 2
+                    drivable_logits_sample = drivable_logits_grid[:, center_idx, center_idx]  # [N_map_query]
                 except Exception:
                     # Fallback for slightly different shapes
                     dl_last = map_drivable_logits[-1]
