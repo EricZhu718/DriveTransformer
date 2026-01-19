@@ -127,6 +127,9 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         # Forecasting method: 'moving_average' or 'linear_fit'
         self.forecast_method = 'moving_average'  # Change this to switch methods
 
+        # Use predicted vehicles (from model) or ground truth vehicles (from CARLA) in reward function
+        self.use_predicted_vehicles_for_reward = True  # True = use model predictions, False = use GT from CARLA
+
         # string = pathlib.Path(os.environ['ROUTES']).stem + '_'
         string = self.save_name
         self.save_path = pathlib.Path(os.environ['SAVE_PATH']) / string
@@ -389,6 +392,8 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 'command_far_xy':far_node,    
                 }
         return result
+
+
     
     @torch.no_grad()
     def run_step(self, input_data, timestamp):
@@ -581,6 +586,9 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         grid_resolution_for_reward = drivable_info['grid_resolution']
         vehicles_info_for_reward = self.get_vehicles_info()
 
+        predicted_vehicle_info_for_reward = self.get_vehicles_info_predicted(output_data_batch)
+        
+
         # Define reward function for diffusion-es that avoids collisions and stays in drivable area
         def reward_fn(trajectories):
             """
@@ -609,10 +617,17 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 drivable_scores = drivable_scores.cpu().numpy()
 
             # Compute collision scores for all waypoints [num_particles, num_timesteps]
-            if len(vehicles_info_for_reward['vehicle_ids']) > 0:
+            # Select vehicle info based on flag
+            if self.use_predicted_vehicles_for_reward:
+                has_vehicles = predicted_vehicle_info_for_reward['num_vehicles'] > 0
+                agent_bbx = predicted_vehicle_info_for_reward['bbox_corners_ego']
+                agent_vel = predicted_vehicle_info_for_reward['ego_velocities']
+            else:
+                has_vehicles = len(vehicles_info_for_reward['vehicle_ids']) > 0
                 agent_bbx = vehicles_info_for_reward['bbox_corners_ego']
                 agent_vel = vehicles_info_for_reward['ego_velocities']
 
+            if has_vehicles:
                 # Version 1: No tolerance (strict collision detection with safety_margin=1.0)
                 collision_scores_no_tolerance = self.get_collision_points(
                     torch.from_numpy(traj_np).float() if not isinstance(traj_reshaped, torch.Tensor) else traj_reshaped,
@@ -922,6 +937,66 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
 
         return drivable_values # [B*num_particles, num_traj_tokens]
 
+    def get_waypoints_in_predicted_drivable_area(self,
+                                                  ego_trajectories,
+                                                  predicted_positions,
+                                                  predicted_probs,
+                                                  k=3):
+        """
+        For each waypoint in ego_trajectories, determine drivability using predicted scattered points.
+        Uses k-nearest neighbors with inverse distance weighting to interpolate probabilities.
+
+        Args:
+            ego_trajectories: [B*num_particles, num_traj_tokens, 2] in ego frame coordinates
+            predicted_positions: [N_points, 2] numpy array of predicted drivable area sample positions
+            predicted_probs: [N_points] numpy array of drivability probabilities at each position
+            k: int, number of nearest neighbors to use for interpolation
+
+        Returns:
+            drivable_values: [B*num_particles, num_traj_tokens] float values (0=non-drivable, 1=drivable)
+        """
+        # Convert to numpy if needed
+        if isinstance(ego_trajectories, torch.Tensor):
+            ego_traj_np = ego_trajectories.cpu().numpy()
+        else:
+            ego_traj_np = ego_trajectories
+
+        batch_size, num_timesteps, _ = ego_traj_np.shape
+
+        # Flatten trajectories for vectorized distance computation
+        # [B*num_particles * num_traj_tokens, 2]
+        waypoints_flat = ego_traj_np.reshape(-1, 2)
+        num_waypoints = waypoints_flat.shape[0]
+
+        # Compute distances from each waypoint to all predicted points
+        # waypoints_flat: [num_waypoints, 2], predicted_positions: [N_points, 2]
+        # distances: [num_waypoints, N_points]
+        diff = waypoints_flat[:, np.newaxis, :] - predicted_positions[np.newaxis, :, :]  # [num_waypoints, N_points, 2]
+        distances = np.linalg.norm(diff, axis=2)  # [num_waypoints, N_points]
+
+        # Find k nearest neighbors for each waypoint
+        k = min(k, len(predicted_positions))
+        nearest_indices = np.argpartition(distances, k, axis=1)[:, :k]  # [num_waypoints, k]
+
+        # Get distances and probabilities for nearest neighbors
+        nearest_distances = np.take_along_axis(distances, nearest_indices, axis=1)  # [num_waypoints, k]
+        nearest_probs = predicted_probs[nearest_indices]  # [num_waypoints, k]
+
+        # Inverse distance weighting
+        # Add small epsilon to avoid division by zero
+        epsilon = 1e-6
+        weights = 1.0 / (nearest_distances + epsilon)  # [num_waypoints, k]
+        weights_sum = weights.sum(axis=1, keepdims=True)  # [num_waypoints, 1]
+        normalized_weights = weights / weights_sum  # [num_waypoints, k]
+
+        # Weighted average of probabilities
+        drivable_values_flat = (normalized_weights * nearest_probs).sum(axis=1)  # [num_waypoints]
+
+        # Reshape back to [B*num_particles, num_traj_tokens]
+        drivable_values = drivable_values_flat.reshape(batch_size, num_timesteps)
+
+        return drivable_values
+
     def get_collision_points(self,
                              ego_trajectories,
                              agent_bbx,
@@ -1218,9 +1293,9 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         print(f"Drivable area map computed in {end_time-start_time:.2f} seconds.", flush=True)  
 
         if draw_traj and diffusion_es_outputs is not None:
-            # Determine number of subplots: Front Image + BEV + Best Trajectory + 1 per iteration
+            # Determine number of subplots: Front Image + BEV + GT + Predictions + 1 per iteration
             num_iterations = len(diffusion_es_outputs.get('iterations', []))
-            num_subplots = 4 + num_iterations  # Front Image, BEV, Best Trajectory, + iterations + one for drivable area
+            num_subplots = 5 + num_iterations  # Front Image, BEV, GT, Predictions, + iterations + one for drivable area
 
             # Arrange in grid: calculate rows and columns
             # Aim for roughly square grid, prefer more columns than rows
@@ -1311,7 +1386,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                               linewidth=1.5, alpha=0.5)
                 axes[ax_idx].add_patch(poly)
 
-            # Draw velocity vectors for all vehicles
+            # Draw velocity vectors for all vehicles (ground truth from CARLA)
             for i in range(len(vehicles_info['vehicle_ids'])):
                 ego_pos = vehicles_info['ego_positions'][i]
                 ego_vel = vehicles_info['ego_velocities'][i]
@@ -1320,50 +1395,107 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                                   head_width=0.5, head_length=0.5, fc='blue', ec='blue',
                                   alpha=0.7, linewidth=2, zorder=20)
 
-            # Draw map anchor points if available with colors
+            axes[ax_idx].set_xlabel('Left (m)')
+            axes[ax_idx].set_ylabel('Forward (m)')
+            axes[ax_idx].set_title(f'Ground Truth - Step {self.step}')
+            axes[ax_idx].grid(True, alpha=0.3)
+            axes[ax_idx].set_xlim(-20, 20)
+            axes[ax_idx].set_ylim(-20, 20)
+            axes[ax_idx].set_aspect('equal', adjustable='box')
+            ax_idx += 1
+
+            # ============================================================
+            # Subplot 3: Predictions (predicted drivable area + predicted vehicles)
+            # ============================================================
+            axes[ax_idx].set_facecolor('black')
+
+            # Overlay drivable area map as background (ground truth for reference)
+            axes[ax_idx].imshow(
+                drivable_map.T,
+                origin='lower',
+                cmap='gray',
+                vmin=0.0,
+                vmax=1.0,
+                alpha=0.3,
+                extent=map_extent,
+                zorder=1
+            )
+
+            # Draw ego vehicle bounding box
+            axes[ax_idx].plot(0, 0, 'yo', markersize=12, label='Ego Vehicle', zorder=10)
+            ego_poly_pred = Polygon(ego_corners, closed=True, facecolor='red', edgecolor='red',
+                              linewidth=2.0, alpha=0.6, zorder=15)
+            axes[ax_idx].add_patch(ego_poly_pred)
+
+            # Draw GT vehicle bounding boxes (filled cyan)
+            for i in range(len(vehicles_info['vehicle_ids'])):
+                corners = vehicles_info['bbox_corners_ego'][i]
+                poly = Polygon(corners, closed=True, facecolor='cyan', edgecolor='cyan',
+                              linewidth=1.5, alpha=0.5, zorder=10)
+                axes[ax_idx].add_patch(poly)
+
+            # Draw GT velocity vectors (blue arrows)
+            for i in range(len(vehicles_info['vehicle_ids'])):
+                ego_pos = vehicles_info['ego_positions'][i]
+                ego_vel = vehicles_info['ego_velocities'][i]
+                axes[ax_idx].arrow(ego_pos[0], ego_pos[1], ego_vel[0], ego_vel[1],
+                                  head_width=0.5, head_length=0.5, fc='blue', ec='blue',
+                                  alpha=0.7, linewidth=2, zorder=20)
+
+            # Draw predicted agent positions and velocities from model output (hollow boxes)
+            predicted_vehicles_info = self.get_vehicles_info_predicted(output_data_batch)
+
+            # Draw predicted bounding boxes (hollow lime boxes) and velocity vectors (lime arrows)
+            for i in range(predicted_vehicles_info['num_vehicles']):
+                # Bounding box
+                corners = predicted_vehicles_info['bbox_corners_ego'][i]
+                pred_poly = Polygon(corners, closed=True, facecolor='none', edgecolor='lime',
+                                   linewidth=2.0, alpha=0.9, zorder=12)
+                axes[ax_idx].add_patch(pred_poly)
+
+                # Velocity vector
+                pos = predicted_vehicles_info['ego_positions'][i]
+                vel = predicted_vehicles_info['ego_velocities'][i]
+                axes[ax_idx].arrow(pos[0], pos[1], vel[0], vel[1],
+                                  head_width=0.5, head_length=0.5, fc='lime', ec='lime',
+                                  alpha=0.8, linewidth=2, zorder=22)
+
+            # Draw predicted drivable area (map anchor points with colors)
             if 'map_reference_points' in output_data_batch[0]:
                 map_anchors = output_data_batch[0]['map_reference_points']  # [num_queries, 2]
                 if isinstance(map_anchors, torch.Tensor):
                     map_anchors_np = map_anchors.cpu().numpy()
                 else:
                     map_anchors_np = map_anchors
-                
+
                 # Extract drivable area predictions if available
                 drivable_preds = self.extract_drivable_area_predictions(output_data_batch)
                 try:
                     print(f"[Debug] save(): anchors count {map_anchors_np.shape[0]}, have_probs {drivable_preds['center_probs'] is not None}", flush=True)
                 except Exception:
                     pass
-                
+
                 # Plot grid-based drivable area predictions if available
-                if (drivable_preds['map_drivable_probs'] is not None and 
+                if (drivable_preds['map_drivable_probs'] is not None and
                     drivable_preds['map_drivable_sampled_positions'] is not None):
-                    
+
                     grid_probs = drivable_preds['map_drivable_probs']  # [N_anchors, grid_size, grid_size]
                     grid_positions = drivable_preds['map_drivable_sampled_positions']  # [N_anchors, grid_size, grid_size, 2]
-                    
+
                     # Flatten grid positions and probabilities for scatter plot
                     flat_positions = grid_positions.reshape(-1, 2)  # [N_anchors * grid_size * grid_size, 2]
                     flat_probs = grid_probs.flatten()  # [N_anchors * grid_size * grid_size]
-                    
+
                     # Plot all grid points with their drivable probabilities
                     scatter = axes[ax_idx].scatter(
                         flat_positions[:, 0], flat_positions[:, 1],
-                        c=flat_probs, cmap='YlOrRd_r', s=20, alpha=0.6, 
+                        c=flat_probs, cmap='YlOrRd_r', s=15, alpha=0.3,
                         marker='s', vmin=0, vmax=1, zorder=3
                     )
                     # Add colorbar for drivability probability
                     cbar = plt.colorbar(scatter, ax=axes[ax_idx], fraction=0.046, pad=0.04)
                     cbar.set_label('Drivable Prob (Grid)', fontsize=8)
-                    
-                    # # Also plot anchor centers with center probabilities for reference
-                    # if drivable_preds['center_probs'] is not None:
-                    #     axes[ax_idx].scatter(
-                    #         map_anchors_np[:, 0], map_anchors_np[:, 1],
-                    #         c=drivable_preds['center_probs'], cmap='plasma', s=100, alpha=0.8, 
-                    #         marker='o', vmin=0, vmax=1, zorder=5, edgecolors='black', linewidth=1
-                    #     )
-                    
+
                 elif drivable_preds['center_probs'] is not None:
                     # Fallback to center probabilities only (backward compatibility)
                     colors = drivable_preds['center_probs']
@@ -1373,7 +1505,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                         pass
                     scatter = axes[ax_idx].scatter(
                         map_anchors_np[:, 0], map_anchors_np[:, 1],
-                        c=colors, cmap='YlOrRd_r', s=50, alpha=0.7, 
+                        c=colors, cmap='YlOrRd_r', s=40, alpha=0.4,
                         marker='o', vmin=0, vmax=1, zorder=3
                     )
                     # Add colorbar for drivability probability
@@ -1387,12 +1519,11 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
 
             axes[ax_idx].set_xlabel('Left (m)')
             axes[ax_idx].set_ylabel('Forward (m)')
-            axes[ax_idx].set_title(f'Best Trajectory - Step {self.step}')
+            axes[ax_idx].set_title(f'Predictions - Step {self.step}')
             axes[ax_idx].grid(True, alpha=0.3)
             axes[ax_idx].set_xlim(-20, 20)
             axes[ax_idx].set_ylim(-20, 20)
             axes[ax_idx].set_aspect('equal', adjustable='box')
-            # axes[ax_idx].legend(loc='upper right')
             ax_idx += 1
 
             # One subplot per iteration showing all particles and selected top-k
@@ -1713,6 +1844,77 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             'ego_positions': np.array(ego_positions) if len(ego_positions) > 0 else np.zeros((0, 2)),
             'ego_velocities': np.array(ego_velocities) if len(ego_velocities) > 0 else np.zeros((0, 2)),
             'bbox_corners_ego': bbox_corners_ego
+        }
+
+    def get_vehicles_info_predicted(self, output_data_batch, score_threshold=0.3):
+        """
+        Extract predicted vehicle information from model output.
+        Returns data in a format compatible with get_vehicles_info() for use in reward functions.
+
+        Args:
+            output_data_batch: Model output containing 'boxes_3d' and 'scores_3d'
+            score_threshold: Minimum confidence score to include a prediction
+
+        Returns:
+            dict: {
+                'num_vehicles': int - number of predicted vehicles
+                'ego_positions': numpy array of shape (num_vehicles, 2) - positions in ego frame [x, y]
+                'ego_velocities': numpy array of shape (num_vehicles, 2) - velocities in ego frame [vx, vy]
+                'bbox_corners_ego': list of numpy arrays - each array is (4, 2) containing corner positions in ego frame
+                'scores': numpy array of shape (num_vehicles,) - confidence scores
+                'labels': numpy array of shape (num_vehicles,) - class labels
+            }
+        """
+        if 'boxes_3d' not in output_data_batch[0]:
+            return {
+                'num_vehicles': 0,
+                'ego_positions': np.zeros((0, 2)),
+                'ego_velocities': np.zeros((0, 2)),
+                'bbox_corners_ego': [],
+                'scores': np.zeros(0),
+                'labels': np.zeros(0)
+            }
+
+        pred_boxes = output_data_batch[0]['boxes_3d'].tensor.cpu().numpy()  # (N, 9) [x, y, z, w, l, h, yaw, vx, vy]
+        pred_scores = output_data_batch[0]['scores_3d'].cpu().numpy()  # (N,)
+        pred_labels = output_data_batch[0]['labels_3d'].cpu().numpy()  # (N,)
+
+        # Filter by score threshold
+        valid_mask = pred_scores >= score_threshold
+        pred_boxes = pred_boxes[valid_mask]
+        pred_scores = pred_scores[valid_mask]
+        pred_labels = pred_labels[valid_mask]
+
+        ego_positions = []
+        ego_velocities = []
+        bbox_corners_ego = []
+
+        for i in range(len(pred_boxes)):
+            x, y, z, w, l, h, yaw, vx, vy = pred_boxes[i]
+
+            # Position in ego frame
+            ego_positions.append(np.array([x, y]))
+
+            # Velocity in ego frame
+            ego_velocities.append(np.array([vx, vy]))
+
+            # Compute bounding box corners
+            corners_local = np.array([
+                [l/2, w/2], [l/2, -w/2], [-l/2, -w/2], [-l/2, w/2]
+            ])
+            yaw_corrected = yaw + np.pi/2
+            cos_yaw, sin_yaw = np.cos(yaw_corrected), np.sin(yaw_corrected)
+            rot_matrix = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
+            corners_ego = (rot_matrix @ corners_local.T).T + np.array([x, y])
+            bbox_corners_ego.append(corners_ego)
+
+        return {
+            'num_vehicles': len(pred_boxes),
+            'ego_positions': np.array(ego_positions) if len(ego_positions) > 0 else np.zeros((0, 2)),
+            'ego_velocities': ego_velocities,  # Keep as list for compatibility with get_collision_points
+            'bbox_corners_ego': bbox_corners_ego,  # List of (4, 2) arrays
+            'scores': pred_scores,
+            'labels': pred_labels
         }
 
     def get_drivable_area_map(self, grid_size=200, grid_resolution=0.2, lookahead_distance=50.0):
