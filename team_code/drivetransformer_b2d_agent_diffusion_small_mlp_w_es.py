@@ -1070,6 +1070,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
     def extract_drivable_area_predictions(self, output_data_batch):
         """
         Extract predicted drivable area values along with their xy positions from anchors.
+        Now supports grid-based predictions around each anchor.
         
         Args:
             output_data_batch: List of output dicts from model inference
@@ -1077,13 +1078,17 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         Returns:
             Dictionary containing:
                 - 'map_reference_points': [num_anchors, 2] - xy positions of anchors
-                - 'map_drivable_logits': [num_anchors] - predicted drivable area logits
-                - 'map_drivable_probs': [num_anchors] - predicted drivable area probabilities (sigmoid)
+                - 'map_drivable_logits': [num_anchors, grid_size, grid_size] - predicted drivable area logits per grid
+                - 'map_drivable_probs': [num_anchors, grid_size, grid_size] - predicted drivable area probabilities (sigmoid)
+                - 'map_drivable_sampled_positions': [num_anchors, grid_size, grid_size, 2] - xy positions of each grid cell
+                - 'center_probs': [num_anchors] - center grid cell probabilities for backward compatibility
         """
         result = {
             'map_reference_points': None,
             'map_drivable_logits': None,
             'map_drivable_probs': None,
+            'map_drivable_sampled_positions': None,
+            'center_probs': None,
         }
         
         # Debug: batch presence
@@ -1110,42 +1115,88 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             except Exception:
                 pass
         
-        # Extract drivable area logits if available
-        if 'map_drivable_logits' in batch_output:
+        # Extract grid-based drivable area logits if available
+        # Priority: 1) Use accumulated logits (iterative refinement), 2) Fall back to raw logits
+        drivable_logits = None
+        use_accumulated = False
+        
+        if 'map_drivable_accumulated_logits' in batch_output and batch_output['map_drivable_accumulated_logits'] is not None:
+            drivable_logits = batch_output['map_drivable_accumulated_logits']
+            use_accumulated = True
+            try:
+                print("[Debug] Using accumulated logits for iterative refinement", flush=True)
+            except Exception:
+                pass
+        elif 'map_drivable_logits' in batch_output:
             drivable_logits = batch_output['map_drivable_logits']
-            
-            # Handle different tensor shapes
-            # map_drivable_logits shape: [N_layers, B, N_map_query, 1]
-            # We'll use the last layer's predictions
+            try:
+                print("[Debug] Using raw logits (accumulated not available)", flush=True)
+            except Exception:
+                pass
+        
+        if drivable_logits is not None:
+            # Handle grid-based tensor shapes
+            # map_drivable_logits shape: [N_layers, B, N_map_query, grid_size, grid_size]
+            # map_drivable_accumulated_logits shape: [N_layers, B, N_map_query, grid_size, grid_size]
+            # We'll use the last layer's predictions (final refinement state)
             if isinstance(drivable_logits, torch.Tensor):
                 try:
-                    print(f"[Debug] raw map_drivable_logits tensor shape: {tuple(drivable_logits.shape)}", flush=True)
+                    logits_type = "accumulated" if use_accumulated else "raw"
+                    print(f"[Debug] {logits_type} map_drivable_logits tensor shape: {tuple(drivable_logits.shape)}", flush=True)
                 except Exception:
                     pass
-                if drivable_logits.dim() == 4:
-                    # [N_layers, B, N_map_query, 1] -> [N_map_query]
-                    drivable_logits = drivable_logits[-1, 0, :, 0]  # Last layer, batch 0, remove class dim
+                if drivable_logits.dim() == 5:
+                    # [N_layers, B, N_map_query, grid_size, grid_size] -> [N_map_query, grid_size, grid_size]
+                    drivable_logits = drivable_logits[-1, 0]  # Last layer, batch 0
+                elif drivable_logits.dim() == 4:
+                    # [B, N_map_query, grid_size, grid_size] -> [N_map_query, grid_size, grid_size]
+                    drivable_logits = drivable_logits[0]
                 elif drivable_logits.dim() == 3:
-                    # [B, N_map_query, 1] -> [N_map_query]
-                    drivable_logits = drivable_logits[0, :, 0]
-                elif drivable_logits.dim() == 2:
-                    # [B, N_map_query] or [N_map_query, 1]
-                    if drivable_logits.shape[0] == 1:
-                        drivable_logits = drivable_logits[0]
-                    else:
-                        drivable_logits = drivable_logits[:, 0]
+                    # Assume it's already [N_map_query, grid_size, grid_size]
+                    pass
+                else:
+                    print(f"[Warning] Unexpected drivable_logits dimensions: {drivable_logits.dim()}", flush=True)
+                    return result
                 
                 logits_np = drivable_logits.cpu().numpy()
             else:
                 logits_np = np.array(drivable_logits)
-                if logits_np.ndim > 1:
-                    logits_np = logits_np.squeeze()
+            
+            # Debug: Print raw logits statistics
+            try:
+                print(f"[Debug] raw logits - shape: {logits_np.shape}, min: {logits_np.min():.6f}, max: {logits_np.max():.6f}, mean: {logits_np.mean():.6f}, std: {logits_np.std():.6f}", flush=True)
+            except Exception:
+                pass
             
             result['map_drivable_logits'] = logits_np
             result['map_drivable_probs'] = 1.0 / (1.0 + np.exp(-logits_np))  # sigmoid
+            
+            # Extract center grid cell probabilities for backward compatibility
+            if logits_np.ndim == 3:  # [N_map_query, grid_size, grid_size]
+                grid_size = logits_np.shape[-1]
+                center_idx = grid_size // 2
+                center_logits = logits_np[:, center_idx, center_idx]  # [N_map_query]
+                result['center_probs'] = 1.0 / (1.0 + np.exp(-center_logits))
+            
             try:
                 probs = result['map_drivable_probs']
                 print(f"[Debug] map_drivable_probs: shape {probs.shape}, min {probs.min():.3f}, max {probs.max():.3f}", flush=True)
+                if result['center_probs'] is not None:
+                    center = result['center_probs']
+                    print(f"[Debug] center_probs: shape {center.shape}, min {center.min():.3f}, max {center.max():.3f}", flush=True)
+            except Exception:
+                pass
+        
+        # Extract sampled positions if available
+        if 'map_drivable_sampled_positions' in batch_output:
+            sampled_positions = batch_output['map_drivable_sampled_positions']
+            if isinstance(sampled_positions, torch.Tensor):
+                result['map_drivable_sampled_positions'] = sampled_positions.cpu().numpy()
+            else:
+                result['map_drivable_sampled_positions'] = np.array(sampled_positions)
+            try:
+                pos_np = result['map_drivable_sampled_positions']
+                print(f"[Debug] map_drivable_sampled_positions: shape {pos_np.shape}", flush=True)
             except Exception:
                 pass
         
@@ -1280,15 +1331,44 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 # Extract drivable area predictions if available
                 drivable_preds = self.extract_drivable_area_predictions(output_data_batch)
                 try:
-                    print(f"[Debug] save(): anchors count {map_anchors_np.shape[0]}, have_probs {drivable_preds['map_drivable_probs'] is not None}", flush=True)
+                    print(f"[Debug] save(): anchors count {map_anchors_np.shape[0]}, have_probs {drivable_preds['center_probs'] is not None}", flush=True)
                 except Exception:
                     pass
                 
-                if drivable_preds['map_drivable_probs'] is not None:
-                    # Use drivable probability to color the anchors
-                    colors = drivable_preds['map_drivable_probs']
+                # Plot grid-based drivable area predictions if available
+                if (drivable_preds['map_drivable_probs'] is not None and 
+                    drivable_preds['map_drivable_sampled_positions'] is not None):
+                    
+                    grid_probs = drivable_preds['map_drivable_probs']  # [N_anchors, grid_size, grid_size]
+                    grid_positions = drivable_preds['map_drivable_sampled_positions']  # [N_anchors, grid_size, grid_size, 2]
+                    
+                    # Flatten grid positions and probabilities for scatter plot
+                    flat_positions = grid_positions.reshape(-1, 2)  # [N_anchors * grid_size * grid_size, 2]
+                    flat_probs = grid_probs.flatten()  # [N_anchors * grid_size * grid_size]
+                    
+                    # Plot all grid points with their drivable probabilities
+                    scatter = axes[ax_idx].scatter(
+                        flat_positions[:, 0], flat_positions[:, 1],
+                        c=flat_probs, cmap='YlOrRd_r', s=20, alpha=0.6, 
+                        marker='s', vmin=0, vmax=1, zorder=3
+                    )
+                    # Add colorbar for drivability probability
+                    cbar = plt.colorbar(scatter, ax=axes[ax_idx], fraction=0.046, pad=0.04)
+                    cbar.set_label('Drivable Prob (Grid)', fontsize=8)
+                    
+                    # # Also plot anchor centers with center probabilities for reference
+                    # if drivable_preds['center_probs'] is not None:
+                    #     axes[ax_idx].scatter(
+                    #         map_anchors_np[:, 0], map_anchors_np[:, 1],
+                    #         c=drivable_preds['center_probs'], cmap='plasma', s=100, alpha=0.8, 
+                    #         marker='o', vmin=0, vmax=1, zorder=5, edgecolors='black', linewidth=1
+                    #     )
+                    
+                elif drivable_preds['center_probs'] is not None:
+                    # Fallback to center probabilities only (backward compatibility)
+                    colors = drivable_preds['center_probs']
                     try:
-                        print(f"[Debug] save(): drivable probs min {colors.min():.3f}, max {colors.max():.3f}", flush=True)
+                        print(f"[Debug] save(): center probs min {colors.min():.3f}, max {colors.max():.3f}", flush=True)
                     except Exception:
                         pass
                     scatter = axes[ax_idx].scatter(
@@ -1312,7 +1392,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             axes[ax_idx].set_xlim(-20, 20)
             axes[ax_idx].set_ylim(-20, 20)
             axes[ax_idx].set_aspect('equal', adjustable='box')
-            axes[ax_idx].legend(loc='upper right')
+            # axes[ax_idx].legend(loc='upper right')
             ax_idx += 1
 
             # One subplot per iteration showing all particles and selected top-k

@@ -249,11 +249,10 @@ class DriveTransformer(MVXTwoStageDetector):
             # Support both old (9 elements) and new (10 elements with drivable logits) formats
             if len(entry) >= 10:
                 bboxes, scores, labels, trajs, map_bboxes, \
-                map_scores, map_labels, map_pts, map_ref_pts, map_drivable_logits = entry[:10]
+                map_scores, map_labels, map_pts, map_ref_pts, _ = entry[:10]  # Ignore center-point logits from get_bboxes
             else:
                 bboxes, scores, labels, trajs, map_bboxes, \
                 map_scores, map_labels, map_pts, map_ref_pts = entry
-                map_drivable_logits = None
             bbox_result = bbox3d2result(bboxes, scores, labels)
             bbox_result['trajs_3d'] = trajs.cpu()
             map_bbox_result = dict(
@@ -272,9 +271,15 @@ class DriveTransformer(MVXTwoStageDetector):
                 bbox_result['agent_traj_cls_scores'] = outs['all_traj_cls_scores'][-1].cpu()
             if map_ref_pts is not None:
                 bbox_result['map_reference_points'] = map_ref_pts.cpu()
-            # Add drivable logits if available
-            if map_drivable_logits is not None:
-                bbox_result['map_drivable_logits'] = map_drivable_logits.cpu()
+            
+            # Add grid-based drivable area outputs if available (use full grid, not center-point only)
+            if 'map_drivable_logits' in outs and outs['map_drivable_logits'] is not None:
+                bbox_result['map_drivable_logits'] = outs['map_drivable_logits'][-1, i].cpu()  # Last layer, current batch [N_map_query, grid_size, grid_size]
+            if 'map_drivable_accumulated_logits' in outs and outs['map_drivable_accumulated_logits'] is not None:
+                bbox_result['map_drivable_accumulated_logits'] = outs['map_drivable_accumulated_logits'][-1, i].cpu()
+            if 'map_drivable_sampled_positions' in outs and outs['map_drivable_sampled_positions'] is not None:
+                bbox_result['map_drivable_sampled_positions'] = outs['map_drivable_sampled_positions'][i].cpu()
+                
             bbox_results.append(bbox_result)
 
         return bbox_results

@@ -133,7 +133,7 @@ map_num_propagated = 50
 memory_len_frame = 10
 num_mode = 6
 num_gpus = 4
-batch_size = 6
+batch_size = 8
 num_iters_per_epoch = 200000 // (num_gpus * batch_size)
 
 data_aug_conf = {
@@ -474,7 +474,7 @@ test_pipeline = [
 
 data = dict(
     samples_per_gpu=batch_size,
-    workers_per_gpu=1,  # Reduced from 12 to avoid memory spike (each worker copies ~7GB map_infos)
+    workers_per_gpu=4,  # Reduced from 12 to avoid memory spike (each worker copies ~7GB map_infos)
     train = dict(
         type = dataset_type,
         data_root=data_root,
