@@ -135,9 +135,6 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         self.save_path = pathlib.Path(os.environ['SAVE_PATH']) / string
         self.save_path.mkdir(parents=True, exist_ok=False)
 
-        (self.save_path / 'combined').mkdir()
-        (self.save_path / 'meta').mkdir()
-
         # transform from lidar to image coordinates
         self.lidar2img = {
         'CAM_FRONT':np.array([[ 1.14251841e+03,  8.00000000e+02,  0.00000000e+00, -9.52000000e+02],
@@ -587,6 +584,20 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         vehicles_info_for_reward = self.get_vehicles_info()
 
         predicted_vehicle_info_for_reward = self.get_vehicles_info_predicted(output_data_batch)
+
+        # Extract predicted drivable area for use when use_predicted_vehicles_for_reward is True
+        predicted_drivable_info = self.extract_drivable_area_predictions(output_data_batch)
+        # Flatten the grid positions and probs for use in get_waypoints_in_predicted_drivable_area
+        if (predicted_drivable_info['map_drivable_sampled_positions'] is not None and
+            predicted_drivable_info['map_drivable_probs'] is not None):
+            # [N_anchors, grid_size, grid_size, 2] -> [N_anchors * grid_size * grid_size, 2]
+            predicted_drivable_positions_for_reward = predicted_drivable_info['map_drivable_sampled_positions'].reshape(-1, 2)
+            # [N_anchors, grid_size, grid_size] -> [N_anchors * grid_size * grid_size]
+            # Round probabilities to binary 0/1 (threshold at 0.5)
+            predicted_drivable_probs_for_reward = (predicted_drivable_info['map_drivable_probs'].flatten() >= 0.5).astype(np.float32)
+        else:
+            predicted_drivable_positions_for_reward = None
+            predicted_drivable_probs_for_reward = None
         
 
         # Define reward function for diffusion-es that avoids collisions and stays in drivable area
@@ -610,15 +621,23 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 traj_np = traj_reshaped
 
             # Compute drivability scores for all waypoints [num_particles, num_timesteps]
-            drivable_scores = self.get_waypoints_in_drivable_area(
-                traj_np, drivable_map_for_reward, grid_resolution_for_reward
-            )
+            # Select drivable area source based on flag
+            if self.use_predicted_vehicles_for_reward and predicted_drivable_positions_for_reward is not None:
+                # Use predicted drivable area from model
+                drivable_scores = self.get_waypoints_in_predicted_drivable_area(
+                    traj_np, predicted_drivable_positions_for_reward, predicted_drivable_probs_for_reward
+                )
+            else:
+                # Use ground truth drivable area from CARLA
+                drivable_scores = self.get_waypoints_in_drivable_area(
+                    traj_np, drivable_map_for_reward, grid_resolution_for_reward
+                )
             if isinstance(drivable_scores, torch.Tensor):
                 drivable_scores = drivable_scores.cpu().numpy()
 
             # Compute collision scores for all waypoints [num_particles, num_timesteps]
-            # Select vehicle info based on flag
-            if self.use_predicted_vehicles_for_reward:
+            # Select vehicle info based on flag (must be consistent with drivable area check)
+            if self.use_predicted_vehicles_for_reward and predicted_drivable_positions_for_reward is not None:
                 has_vehicles = predicted_vehicle_info_for_reward['num_vehicles'] > 0
                 agent_bbx = predicted_vehicle_info_for_reward['bbox_corners_ego']
                 agent_vel = predicted_vehicle_info_for_reward['ego_velocities']
@@ -1691,10 +1710,8 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             
             # Save the figure
             if self.save_path is not None:
-                bev_viz_dir = self.save_path / 'bev_viz'
-                bev_viz_dir.mkdir(parents=True, exist_ok=True)
-                save_path = bev_viz_dir / f'bev_traj_{frame:04d}.jpg'
-                plt.savefig(str(save_path), dpi=300)
+                save_path = self.save_path / f'bev_traj_{frame:04d}.jpg'
+                plt.savefig(str(save_path), dpi=100)
 
             plt.close(fig)
 
