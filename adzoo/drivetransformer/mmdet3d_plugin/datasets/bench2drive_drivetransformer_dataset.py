@@ -444,7 +444,7 @@ class B2D_DriveTransformer_Dataset(Custom3DDataset):
         
         # Set drivable area path to be loaded by LoadDrivableArea pipeline step
         if self._load_drivable_area:
-            drivable_area_path = osp.join(self.data_root, info['folder'], 'drivable_area', f"{info['frame_idx']:05d}.npy")
+            drivable_area_path = osp.join(self.data_root, info['folder'], 'drivable_area_try_2', f"{info['frame_idx']:05d}.npy")
             input_dict['drivable_area_path'] = drivable_area_path
         else:
             input_dict['drivable_area_path'] = None

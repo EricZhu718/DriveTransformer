@@ -2824,6 +2824,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
                                        renoise_ratio=0.5,
                                        eta=0.0,
                                        clip_denoised=False,
+                                       include_zero_trajectory=False,
                                        device=None):
         """
         Generate trajectory samples using Diffusion-ES (Evolution Strategies) with reward guidance.
@@ -2856,6 +2857,7 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
                           Higher values = less noise added, more of original trajectory preserved
             eta: DDIM stochasticity parameter
             clip_denoised: Whether to clip denoised trajectories
+            include_zero_trajectory: Whether to add a zero trajectory (staying at origin) to final population (default: False)
             device: Device to generate on
 
         Returns:
@@ -3014,15 +3016,30 @@ class DriveTransformerlHead_Small_Mlp_Diffusion_Head(BaseModule):
             perm = torch.randperm(num_particles, device=device)
             x = x[:, perm, :]
 
+        # Conditionally add zero trajectory (staying at origin) to the final population
+        if include_zero_trajectory:
+            # Create zero trajectory in unnormalized space: all waypoints at [0, 0] (ego position)
+            num_traj_tokens = traj_dim // 2
+            zero_trajectory_unnorm = torch.zeros(batch_size, num_traj_tokens, 2, device=device)  # [B, T, 2]
+            # Normalize the zero trajectory to match the population format
+            zero_trajectory_norm = self.diffusion_head.normalize_trajectory(zero_trajectory_unnorm)  # [B, T, 2]
+            zero_trajectory_flat = zero_trajectory_norm.reshape(batch_size, 1, traj_dim)  # [B, 1, traj_dim]
+            
+            # Concatenate zero trajectory to the existing population
+            x = torch.cat([x, zero_trajectory_flat], dim=1)  # [B, num_particles+1, traj_dim]
+            num_particles_final = num_particles + 1
+        else:
+            num_particles_final = num_particles
+        
         # Final evaluation to select best trajectory
-        x_flat = x.reshape(batch_size * num_particles, traj_dim)
+        x_flat = x.reshape(batch_size * num_particles_final, traj_dim)
         # Unnormalize before final reward evaluation
-        x_flat_unnormalized = self.diffusion_head.unnormalize_trajectory(x_flat)  # [B*num_particles, num_traj_tokens, 2]
-        x_flat_unnormalized = x_flat_unnormalized.reshape(batch_size * num_particles, -1)
+        x_flat_unnormalized = self.diffusion_head.unnormalize_trajectory(x_flat)  # [B*num_particles_final, num_traj_tokens, 2]
+        x_flat_unnormalized = x_flat_unnormalized.reshape(batch_size * num_particles_final, -1)
         final_rewards = reward_fn(x_flat_unnormalized)
         if not isinstance(final_rewards, torch.Tensor):
             final_rewards = torch.tensor(final_rewards, device=device, dtype=torch.float32)
-        final_rewards = final_rewards.reshape(batch_size, num_particles)
+        final_rewards = final_rewards.reshape(batch_size, num_particles_final)
         best_indices = torch.argmax(final_rewards, dim=1)
 
         # Gather best trajectories (in normalized space)

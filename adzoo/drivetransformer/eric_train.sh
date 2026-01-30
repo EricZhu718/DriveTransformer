@@ -1,1 +1,1 @@
-bash adzoo/drivetransformer/dist_train.sh adzoo/drivetransformer/configs/drivetransformer/drivetransformer_large_w_diffusion_head_small_mlp.py 4
+CUDA_VISIBLE_DEVICES=1,2,3 bash adzoo/drivetransformer/dist_train.sh adzoo/drivetransformer/configs/drivetransformer/drivetransformer_large_w_diffusion_head_small_mlp.py 3

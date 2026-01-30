@@ -133,7 +133,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         # string = pathlib.Path(os.environ['ROUTES']).stem + '_'
         string = self.save_name
         self.save_path = pathlib.Path(os.environ['SAVE_PATH']) / string
-        self.save_path.mkdir(parents=True, exist_ok=False)
+        # self.save_path.mkdir(parents=True, exist_ok=False)
 
         # transform from lidar to image coordinates
         self.lidar2img = {
@@ -303,6 +303,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                         'id': 'bev'
                     }
         }
+
    
     def _init(self):
         # get gps reference point
@@ -331,8 +332,13 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
 
 
         # determine if we should save the data
-        # self.should_save_data = random.random() < 0.4
-        self.should_save_data = True
+        self.should_save_data = random.random() < 0.4
+        # self.should_save_data = True
+        # self.should_save_data = None
+
+        # Create save directory only if we're going to save data
+        if self.should_save_data and self.save_path is not None:
+            self.save_path.mkdir(parents=True, exist_ok=False)
 
         # diffusion-es replanning frequency control
         self.replan_every_n_steps = 10  # Replan every N steps
@@ -521,33 +527,6 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         # output_data_batch[0]['ego_fut_preds_fix_dist']: shape of (1,1,20,2)
         # output_data_batch[0]['map_reference_points']: shape of (100, 2) - map anchor positions in ego frame
 
-        # Debug: Inspect presence and shapes of drivable-related outputs
-        try:
-            print(f"[Debug] output_data_batch type: {type(output_data_batch)}, len: {len(output_data_batch)}", flush=True)
-            if isinstance(output_data_batch, (list, tuple)) and len(output_data_batch) > 0:
-                keys0 = list(output_data_batch[0].keys())
-                print(f"[Debug] output_data_batch[0] keys: {keys0}", flush=True)
-                if 'map_reference_points' in output_data_batch[0]:
-                    mrp = output_data_batch[0]['map_reference_points']
-                    if hasattr(mrp, 'shape'):
-                        print(f"[Debug] map_reference_points shape: {tuple(mrp.shape)}", flush=True)
-                    else:
-                        try:
-                            print(f"[Debug] map_reference_points len: {len(mrp)}", flush=True)
-                        except Exception:
-                            print(f"[Debug] map_reference_points type: {type(mrp)}", flush=True)
-                if 'map_drivable_logits' in output_data_batch[0]:
-                    mdl = output_data_batch[0]['map_drivable_logits']
-                    # Try to print shapes robustly
-                    if hasattr(mdl, 'shape'):
-                        print(f"[Debug] map_drivable_logits shape: {tuple(mdl.shape)}", flush=True)
-                    else:
-                        print(f"[Debug] map_drivable_logits type: {type(mdl)}", flush=True)
-                else:
-                    print("[Debug] 'map_drivable_logits' not present in output_data_batch[0]", flush=True)
-        except Exception as e:
-            print(f"[Debug] Error printing output_data_batch debug info: {e}", flush=True)
-
         # ========================================================================
         # DIFFUSION SAMPLING: Replace fixed trajectories with diffusion-generated ones
         # ========================================================================
@@ -598,129 +577,6 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         else:
             predicted_drivable_positions_for_reward = None
             predicted_drivable_probs_for_reward = None
-        
-
-        # Define reward function for diffusion-es that avoids collisions and stays in drivable area
-        def reward_fn(trajectories):
-            """
-            Reward function that avoids collisions and stays in drivable area.
-            Penalizes based on time-to-collision: immediate collisions heavily penalized,
-            future collisions less so. Only penalizes once based on earliest collision.
-            trajectories: [B*num_particles, num_traj_tokens * 2] in unnormalized absolute coordinates
-            Returns: rewards [B*num_particles] (higher is better)
-            """
-            # Trajectories are in unnormalized absolute coordinates, reshape to [B*N, num_traj_tokens, 2]
-            traj_reshaped = trajectories.reshape(trajectories.shape[0], -1, 2)
-            num_particles = traj_reshaped.shape[0]
-            num_timesteps = traj_reshaped.shape[1]
-
-            # Convert trajectories to numpy for processing
-            if isinstance(traj_reshaped, torch.Tensor):
-                traj_np = traj_reshaped.cpu().numpy()
-            else:
-                traj_np = traj_reshaped
-
-            # Compute drivability scores for all waypoints [num_particles, num_timesteps]
-            # Select drivable area source based on flag
-            if self.use_predicted_vehicles_for_reward and predicted_drivable_positions_for_reward is not None:
-                # Use predicted drivable area from model
-                drivable_scores = self.get_waypoints_in_predicted_drivable_area(
-                    traj_np, predicted_drivable_positions_for_reward, predicted_drivable_probs_for_reward
-                )
-            else:
-                # Use ground truth drivable area from CARLA
-                drivable_scores = self.get_waypoints_in_drivable_area(
-                    traj_np, drivable_map_for_reward, grid_resolution_for_reward
-                )
-            if isinstance(drivable_scores, torch.Tensor):
-                drivable_scores = drivable_scores.cpu().numpy()
-
-            # Compute collision scores for all waypoints [num_particles, num_timesteps]
-            # Select vehicle info based on flag (must be consistent with drivable area check)
-            if self.use_predicted_vehicles_for_reward and predicted_drivable_positions_for_reward is not None:
-                has_vehicles = predicted_vehicle_info_for_reward['num_vehicles'] > 0
-                agent_bbx = predicted_vehicle_info_for_reward['bbox_corners_ego']
-                agent_vel = predicted_vehicle_info_for_reward['ego_velocities']
-            else:
-                has_vehicles = len(vehicles_info_for_reward['vehicle_ids']) > 0
-                agent_bbx = vehicles_info_for_reward['bbox_corners_ego']
-                agent_vel = vehicles_info_for_reward['ego_velocities']
-
-            if has_vehicles:
-                # Version 1: No tolerance (strict collision detection with safety_margin=1.0)
-                collision_scores_no_tolerance = self.get_collision_points(
-                    torch.from_numpy(traj_np).float() if not isinstance(traj_reshaped, torch.Tensor) else traj_reshaped,
-                    agent_bbx, agent_vel, dt=0.2, safety_margin=1.0
-                )
-                if isinstance(collision_scores_no_tolerance, torch.Tensor):
-                    collision_scores_no_tolerance = collision_scores_no_tolerance.cpu().numpy()
-
-                # Version 2: With tolerance (more lenient, safety_margin=0.3)
-                collision_scores_with_tolerance = self.get_collision_points(
-                    torch.from_numpy(traj_np).float() if not isinstance(traj_reshaped, torch.Tensor) else traj_reshaped,
-                    agent_bbx, agent_vel, dt=0.2, safety_margin=0.3
-                )
-                if isinstance(collision_scores_with_tolerance, torch.Tensor):
-                    collision_scores_with_tolerance = collision_scores_with_tolerance.cpu().numpy()
-            else:
-                collision_scores_no_tolerance = np.zeros((num_particles, num_timesteps))
-                collision_scores_with_tolerance = np.zeros((num_particles, num_timesteps))
-
-            # Create time-based weights: exponential decay emphasizing earlier timesteps
-            # Earlier timesteps get higher weight (more important to get right)
-            time_weights = np.exp(-0.1 * np.arange(num_timesteps))  # Exponential decay
-            time_weights = time_weights / time_weights.sum()  # Normalize to sum to 1
-
-            # Compute rewards for each trajectory
-            rewards = np.zeros(num_particles, dtype=np.float32)
-            for i in range(num_particles):
-                # Drivability reward: weighted sum of drivable scores (0-1 per timestep)
-                # Higher = more time in drivable area
-                drivability_reward = (drivable_scores[i] * time_weights).sum()
-
-                # Collision penalty (NO TOLERANCE): Only penalize earliest collision
-                # Find first timestep with collision
-                collision_timesteps_no_tol = np.where(collision_scores_no_tolerance[i] > 0.5)[0]
-                if len(collision_timesteps_no_tol) > 0:
-                    earliest_collision_time_no_tol = collision_timesteps_no_tol[0]
-                    # Penalty decreases exponentially with time-to-collision
-                    # Immediate collision (t=0) gets full penalty, later collisions get less
-                    time_to_collision_no_tol = earliest_collision_time_no_tol
-                    collision_penalty_no_tol = 100.0 * np.exp(-0.1 * time_to_collision_no_tol)
-                else:
-                    collision_penalty_no_tol = 0.0
-
-                # Collision penalty (WITH TOLERANCE): Only penalize earliest collision
-                collision_timesteps_with_tol = np.where(collision_scores_with_tolerance[i] > 0.5)[0]
-                if len(collision_timesteps_with_tol) > 0:
-                    earliest_collision_time_with_tol = collision_timesteps_with_tol[0]
-                    time_to_collision_with_tol = earliest_collision_time_with_tol
-                    collision_penalty_with_tol = 100.0 * np.exp(-0.1 * time_to_collision_with_tol)
-                else:
-                    collision_penalty_with_tol = 0.0
-
-                # Forward progress reward: encourage moving forward (positive y)
-                forward_progress = (traj_np[i, :, 1] * time_weights).sum()  # y = forward direction
-
-                # Straightness reward: penalize excessive lateral movement
-                lateral_deviation = np.abs(traj_np[i, :, 0] * time_weights).sum()  # x = left direction
-
-                # Combine rewards with weights
-                # Using weighted combination: 50% no tolerance, 50% with tolerance
-                combined_collision_penalty = 0.5 * collision_penalty_no_tol + 0.5 * collision_penalty_with_tol
-
-                reward = (
-                    10.0 * drivability_reward +      # Stay in drivable area (0-10)
-                    -combined_collision_penalty +    # Avoid collisions (penalty based on earliest collision)
-                    0.0 * forward_progress +         # Make forward progress
-                    -0.0 * lateral_deviation         # Minimize lateral deviation
-                )
-
-                rewards[i] = reward
-
-            # Convert back to torch tensor
-            rewards_tensor = torch.from_numpy(rewards).to(trajectories.device)
-            return rewards_tensor
 
         # Check if we need to replan or can reuse cached trajectory
         steps_since_last_replan = self.step - self.last_replan_step
@@ -728,6 +584,149 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                         steps_since_last_replan >= self.replan_every_n_steps)
 
         if should_replan:
+
+            # Get traffic light info for GT reward function
+            traffic_lights_data = self.get_traffic_lights_info(max_distance=50.0, selection_max_distance=30.0)
+            traffic_light_info = traffic_lights_data['selected_light']
+
+            # Define reward function for diffusion-es that avoids collisions and stays in drivable area
+            def reward_fn(trajectories):
+                """
+                Reward function that avoids collisions and stays in drivable area.
+                Penalizes based on time-to-collision: immediate collisions heavily penalized,
+                future collisions less so. Only penalizes once based on earliest collision.
+                trajectories: [B*num_particles, num_traj_tokens * 2] in unnormalized absolute coordinates
+                Returns: rewards [B*num_particles] (higher is better)
+                """
+                # Trajectories are in unnormalized absolute coordinates, reshape to [B*N, num_traj_tokens, 2]
+                traj_reshaped = trajectories.reshape(trajectories.shape[0], -1, 2)
+                num_particles = traj_reshaped.shape[0]
+                num_timesteps = traj_reshaped.shape[1]
+
+                # Convert trajectories to numpy for processing
+                if isinstance(traj_reshaped, torch.Tensor):
+                    traj_np = traj_reshaped.cpu().numpy()
+                else:
+                    traj_np = traj_reshaped
+
+                # Compute drivability scores for all waypoints [num_particles, num_timesteps]
+                # Select drivable area source based on flag
+                if self.use_predicted_vehicles_for_reward and predicted_drivable_positions_for_reward is not None:
+                    # Use predicted drivable area from model
+                    drivable_scores = self.get_waypoints_in_predicted_drivable_area(
+                        traj_np, predicted_drivable_positions_for_reward, predicted_drivable_probs_for_reward
+                    )
+                else:
+                    # Use ground truth drivable area from CARLA
+                    drivable_scores = self.get_waypoints_in_drivable_area(
+                        traj_np, drivable_map_for_reward, grid_resolution_for_reward
+                    )
+                if isinstance(drivable_scores, torch.Tensor):
+                    drivable_scores = drivable_scores.cpu().numpy()
+
+                # Compute collision scores for all waypoints [num_particles, num_timesteps]
+                # Select vehicle info based on flag (must be consistent with drivable area check)
+                if self.use_predicted_vehicles_for_reward and predicted_drivable_positions_for_reward is not None:
+                    has_vehicles = predicted_vehicle_info_for_reward['num_vehicles'] > 0
+                    agent_bbx = predicted_vehicle_info_for_reward['bbox_corners_ego']
+                    agent_vel = predicted_vehicle_info_for_reward['ego_velocities']
+                else:
+                    has_vehicles = len(vehicles_info_for_reward['vehicle_ids']) > 0
+                    agent_bbx = vehicles_info_for_reward['bbox_corners_ego']
+                    agent_vel = vehicles_info_for_reward['ego_velocities']
+
+                if has_vehicles:
+                    # Version 1: No tolerance (strict collision detection with safety_margin=1.0)
+                    collision_scores_no_tolerance = self.get_collision_points(
+                        torch.from_numpy(traj_np).float() if not isinstance(traj_reshaped, torch.Tensor) else traj_reshaped,
+                        agent_bbx, agent_vel, dt=0.2, safety_margin=1.0
+                    )
+                    if isinstance(collision_scores_no_tolerance, torch.Tensor):
+                        collision_scores_no_tolerance = collision_scores_no_tolerance.cpu().numpy()
+
+                    # Version 2: With tolerance (more lenient, safety_margin=0.3)
+                    collision_scores_with_tolerance = self.get_collision_points(
+                        torch.from_numpy(traj_np).float() if not isinstance(traj_reshaped, torch.Tensor) else traj_reshaped,
+                        agent_bbx, agent_vel, dt=0.2, safety_margin=0.3
+                    )
+                    if isinstance(collision_scores_with_tolerance, torch.Tensor):
+                        collision_scores_with_tolerance = collision_scores_with_tolerance.cpu().numpy()
+                else:
+                    collision_scores_no_tolerance = np.zeros((num_particles, num_timesteps))
+                    collision_scores_with_tolerance = np.zeros((num_particles, num_timesteps))
+
+                # Create time-based weights: exponential decay emphasizing earlier timesteps
+                # Earlier timesteps get higher weight (more important to get right)
+                time_weights = np.exp(-0.1 * np.arange(num_timesteps))  # Exponential decay
+                time_weights = time_weights / time_weights.sum()  # Normalize to sum to 1
+
+                # Compute rewards for each trajectory
+                rewards = np.zeros(num_particles, dtype=np.float32)
+                for i in range(num_particles):
+                    # Drivability reward: weighted sum of drivable scores (0-1 per timestep)
+                    # Higher = more time in drivable area
+                    drivability_reward = (drivable_scores[i] * time_weights).sum()
+
+                    # Collision penalty (NO TOLERANCE): Only penalize earliest collision
+                    # Find first timestep with collision
+                    collision_timesteps_no_tol = np.where(collision_scores_no_tolerance[i] > 0.5)[0]
+                    if len(collision_timesteps_no_tol) > 0:
+                        earliest_collision_time_no_tol = collision_timesteps_no_tol[0]
+                        # Penalty decreases exponentially with time-to-collision
+                        # Immediate collision (t=0) gets full penalty, later collisions get less
+                        time_to_collision_no_tol = earliest_collision_time_no_tol
+                        collision_penalty_no_tol = 100.0 * np.exp(-0.1 * time_to_collision_no_tol)
+                    else:
+                        collision_penalty_no_tol = 0.0
+
+                    # Collision penalty (WITH TOLERANCE): Only penalize earliest collision
+                    collision_timesteps_with_tol = np.where(collision_scores_with_tolerance[i] > 0.5)[0]
+                    if len(collision_timesteps_with_tol) > 0:
+                        earliest_collision_time_with_tol = collision_timesteps_with_tol[0]
+                        time_to_collision_with_tol = earliest_collision_time_with_tol
+                        collision_penalty_with_tol = 100.0 * np.exp(-0.1 * time_to_collision_with_tol)
+                    else:
+                        collision_penalty_with_tol = 0.0
+
+                    # Forward progress reward: encourage moving forward (positive y)
+                    forward_progress = (traj_np[i, :, 1] * time_weights).sum()  # y = forward direction
+
+                    # Straightness reward: penalize excessive lateral movement
+                    lateral_deviation = np.abs(traj_np[i, :, 0] * time_weights).sum()  # x = left direction
+
+                    # Combine rewards with weights
+                    # Using weighted combination: 50% no tolerance, 50% with tolerance
+                    combined_collision_penalty = 0.5 * collision_penalty_no_tol + 0.5 * collision_penalty_with_tol
+
+                    # Traffic light penalty (GT only): penalize any movement if red light ahead
+                    traffic_light_penalty = 0.0
+                    if not self.use_predicted_vehicles_for_reward:
+                        if (traffic_light_info is not None and
+                            traffic_light_info['state'] == 'Red' and
+                            traffic_light_info['forward_distance'] is not None):
+                            if traffic_light_info['forward_distance'] < 30.0 and traffic_light_info['forward_distance'] > 20.0:
+                                # Penalize any movement (forward or lateral)
+                                max_forward = np.abs(traj_np[i, :, 1]).max()
+                                max_lateral = np.abs(traj_np[i, :, 0]).max()
+                                total_movement = max_forward + max_lateral
+                                if total_movement > 0:
+                                    traffic_light_penalty = 50.0 * total_movement
+
+                    reward = (
+                        10.0 * drivability_reward +      # Stay in drivable area (0-10)
+                        -combined_collision_penalty +    # Avoid collisions (penalty based on earliest collision)
+                        -traffic_light_penalty +         # Don't move at red lights (GT only)
+                        0.0 * forward_progress +         # Make forward progress
+                        -0.0 * lateral_deviation         # Minimize lateral deviation
+                    )
+
+                    rewards[i] = reward
+
+                # Convert back to torch tensor
+                rewards_tensor = torch.from_numpy(rewards).to(trajectories.device)
+                return rewards_tensor
+
+
             # Sample trajectory using diffusion-es with reward guidance
             # Note: sample_trajectory_diffusion_es now returns a dict with unnormalized trajectories
             start_time = time.time()
@@ -1185,16 +1184,9 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             'center_probs': None,
         }
         
-        # Debug: batch presence
-        if output_data_batch is None or len(output_data_batch) == 0:
-            print("[Debug] extract_drivable_area_predictions: empty output_data_batch", flush=True)
-            return result
+
             
         batch_output = output_data_batch[0]
-        try:
-            print(f"[Debug] extract_drivable_area_predictions: keys: {list(batch_output.keys())}", flush=True)
-        except Exception:
-            pass
         
         # Extract map reference points (anchor positions)
         if 'map_reference_points' in batch_output:
@@ -1203,11 +1195,6 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 result['map_reference_points'] = map_ref_points.cpu().numpy()
             else:
                 result['map_reference_points'] = np.array(map_ref_points)
-            try:
-                mrp_np = result['map_reference_points']
-                print(f"[Debug] map_reference_points extracted: shape {mrp_np.shape}, sample {mrp_np[:5]}", flush=True)
-            except Exception:
-                pass
         
         # Extract grid-based drivable area logits if available
         # Priority: 1) Use accumulated logits (iterative refinement), 2) Fall back to raw logits
@@ -1217,16 +1204,8 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         if 'map_drivable_accumulated_logits' in batch_output and batch_output['map_drivable_accumulated_logits'] is not None:
             drivable_logits = batch_output['map_drivable_accumulated_logits']
             use_accumulated = True
-            try:
-                print("[Debug] Using accumulated logits for iterative refinement", flush=True)
-            except Exception:
-                pass
         elif 'map_drivable_logits' in batch_output:
             drivable_logits = batch_output['map_drivable_logits']
-            try:
-                print("[Debug] Using raw logits (accumulated not available)", flush=True)
-            except Exception:
-                pass
         
         if drivable_logits is not None:
             # Handle grid-based tensor shapes
@@ -1234,11 +1213,6 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             # map_drivable_accumulated_logits shape: [N_layers, B, N_map_query, grid_size, grid_size]
             # We'll use the last layer's predictions (final refinement state)
             if isinstance(drivable_logits, torch.Tensor):
-                try:
-                    logits_type = "accumulated" if use_accumulated else "raw"
-                    print(f"[Debug] {logits_type} map_drivable_logits tensor shape: {tuple(drivable_logits.shape)}", flush=True)
-                except Exception:
-                    pass
                 if drivable_logits.dim() == 5:
                     # [N_layers, B, N_map_query, grid_size, grid_size] -> [N_map_query, grid_size, grid_size]
                     drivable_logits = drivable_logits[-1, 0]  # Last layer, batch 0
@@ -1256,11 +1230,6 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             else:
                 logits_np = np.array(drivable_logits)
             
-            # Debug: Print raw logits statistics
-            try:
-                print(f"[Debug] raw logits - shape: {logits_np.shape}, min: {logits_np.min():.6f}, max: {logits_np.max():.6f}, mean: {logits_np.mean():.6f}, std: {logits_np.std():.6f}", flush=True)
-            except Exception:
-                pass
             
             result['map_drivable_logits'] = logits_np
             result['map_drivable_probs'] = 1.0 / (1.0 + np.exp(-logits_np))  # sigmoid
@@ -1272,14 +1241,6 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 center_logits = logits_np[:, center_idx, center_idx]  # [N_map_query]
                 result['center_probs'] = 1.0 / (1.0 + np.exp(-center_logits))
             
-            try:
-                probs = result['map_drivable_probs']
-                print(f"[Debug] map_drivable_probs: shape {probs.shape}, min {probs.min():.3f}, max {probs.max():.3f}", flush=True)
-                if result['center_probs'] is not None:
-                    center = result['center_probs']
-                    print(f"[Debug] center_probs: shape {center.shape}, min {center.min():.3f}, max {center.max():.3f}", flush=True)
-            except Exception:
-                pass
         
         # Extract sampled positions if available
         if 'map_drivable_sampled_positions' in batch_output:
@@ -1290,7 +1251,6 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 result['map_drivable_sampled_positions'] = np.array(sampled_positions)
             try:
                 pos_np = result['map_drivable_sampled_positions']
-                print(f"[Debug] map_drivable_sampled_positions: shape {pos_np.shape}", flush=True)
             except Exception:
                 pass
         
@@ -1305,6 +1265,11 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         # Get vehicle information for bounding box visualization
         vehicles_info = self.get_vehicles_info()
 
+        # Get all traffic lights info and selected traffic light
+        traffic_lights_data = self.get_traffic_lights_info(max_distance=50.0, selection_max_distance=30.0)
+        all_traffic_lights_info = traffic_lights_data['all_lights']
+        traffic_light_info = traffic_lights_data['selected_light']
+
         # Get drivable area map from CARLA
         start_time = time.time()
         drivable_area_info = self.get_drivable_area_map(grid_size=200, grid_resolution=0.2)
@@ -1312,9 +1277,9 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
         print(f"Drivable area map computed in {end_time-start_time:.2f} seconds.", flush=True)  
 
         if draw_traj and diffusion_es_outputs is not None:
-            # Determine number of subplots: Front Image + BEV + GT + Predictions + 1 per iteration
+            # Determine number of subplots: Front Image + BEV + GT + Predictions + Traffic Lights + 1 per iteration + drivable area check
             num_iterations = len(diffusion_es_outputs.get('iterations', []))
-            num_subplots = 5 + num_iterations  # Front Image, BEV, GT, Predictions, + iterations + one for drivable area
+            num_subplots = 6 + num_iterations  # Front Image, BEV, GT, Predictions, Traffic Lights, + iterations + drivable area check
 
             # Arrange in grid: calculate rows and columns
             # Aim for roughly square grid, prefer more columns than rows
@@ -1414,6 +1379,19 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                                   head_width=0.5, head_length=0.5, fc='blue', ec='blue',
                                   alpha=0.7, linewidth=2, zorder=20)
 
+            # Draw traffic light if present
+            if traffic_light_info is not None and traffic_light_info['state'] is not None:
+                tl_lateral = traffic_light_info['lateral_distance']
+                tl_forward = traffic_light_info['forward_distance']
+                tl_state = traffic_light_info['state']
+                print(f"[Traffic Light] state={tl_state}, lateral={tl_lateral:.1f}, forward={tl_forward:.1f}", flush=True)
+                # Map state to color
+                tl_color = {'Red': 'red', 'Yellow': 'yellow', 'Green': 'green', 'Off': 'gray'}.get(tl_state, 'white')
+                axes[ax_idx].plot(tl_lateral, tl_forward, 's', color=tl_color, markersize=15,
+                                 markeredgecolor='black', markeredgewidth=2, zorder=25, label=f'Traffic Light ({tl_state})')
+            else:
+                print(f"[Traffic Light] None found within range", flush=True)
+
             axes[ax_idx].set_xlabel('Left (m)')
             axes[ax_idx].set_ylabel('Forward (m)')
             axes[ax_idx].set_title(f'Ground Truth - Step {self.step}')
@@ -1489,10 +1467,6 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
 
                 # Extract drivable area predictions if available
                 drivable_preds = self.extract_drivable_area_predictions(output_data_batch)
-                try:
-                    print(f"[Debug] save(): anchors count {map_anchors_np.shape[0]}, have_probs {drivable_preds['center_probs'] is not None}", flush=True)
-                except Exception:
-                    pass
 
                 # Plot grid-based drivable area predictions if available
                 if (drivable_preds['map_drivable_probs'] is not None and
@@ -1518,10 +1492,6 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 elif drivable_preds['center_probs'] is not None:
                     # Fallback to center probabilities only (backward compatibility)
                     colors = drivable_preds['center_probs']
-                    try:
-                        print(f"[Debug] save(): center probs min {colors.min():.3f}, max {colors.max():.3f}", flush=True)
-                    except Exception:
-                        pass
                     scatter = axes[ax_idx].scatter(
                         map_anchors_np[:, 0], map_anchors_np[:, 1],
                         c=colors, cmap='YlOrRd_r', s=40, alpha=0.4,
@@ -1543,6 +1513,72 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             axes[ax_idx].set_xlim(-20, 20)
             axes[ax_idx].set_ylim(-20, 20)
             axes[ax_idx].set_aspect('equal', adjustable='box')
+            ax_idx += 1
+
+            # ============================================================
+            # Subplot 4: All Traffic Lights with Dot Products
+            # ============================================================
+            ax = axes[ax_idx]
+            ax.set_facecolor('black')
+            
+            # Plot ego vehicle at origin
+            ax.plot(0, 0, 'yo', markersize=15, label='Ego Vehicle', zorder=100)
+            
+            # Draw ego vehicle forward direction arrow
+            ax.arrow(0, 0, 0, 5, head_width=1.5, head_length=1.5, fc='yellow', ec='yellow',
+                    linewidth=3, alpha=0.8, zorder=101, label='Ego Forward')
+            
+            # Plot all traffic lights
+            for tl_info in all_traffic_lights_info:
+                lateral = tl_info['lateral_distance']
+                forward = tl_info['forward_distance']
+                state = tl_info['state']
+                dot_prod = tl_info['dot_product']
+                in_trigger = tl_info['in_trigger_volume']
+                is_selected = tl_info['is_selected']
+                
+                # Map state to color
+                color_map = {'Red': 'red', 'Yellow': 'yellow', 'Green': 'green', 'Off': 'gray'}
+                color = color_map.get(state, 'white')
+                
+                # Use different marker styles
+                if is_selected:
+                    # Selected traffic light: star marker with thick magenta edge
+                    marker = '*'
+                    marker_size = 30
+                    edge_color = 'magenta'
+                    edge_width = 4
+                elif in_trigger:
+                    # In trigger volume: square with thick black edge
+                    marker = 's'
+                    marker_size = 20
+                    edge_color = 'black'
+                    edge_width = 3
+                else:
+                    # Other traffic lights: circle with thin black edge
+                    marker = 'o'
+                    marker_size = 12
+                    edge_color = 'black'
+                    edge_width = 1
+                
+                # Plot traffic light
+                ax.plot(lateral, forward, marker, color=color, markersize=marker_size,
+                       markeredgecolor=edge_color, markeredgewidth=edge_width, zorder=50, alpha=0.9)
+                
+                # Add label with dot product
+                ax.text(lateral + 1, forward + 1, f'{dot_prod:.2f}', 
+                       fontsize=8, color='white', weight='bold',
+                       bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7),
+                       zorder=51)
+            
+            ax.set_xlabel('Left (m)')
+            ax.set_ylabel('Forward (m)')
+            ax.set_title('All Traffic Lights (★=Selected, ■=In Trigger, ●=Other)')
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(-40, 40)
+            ax.set_ylim(-40, 40)
+            ax.set_aspect('equal', adjustable='box')
+            ax.legend(loc='upper right', fontsize=8)
             ax_idx += 1
 
             # One subplot per iteration showing all particles and selected top-k
@@ -1662,7 +1698,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
                 collision_evals = self.get_collision_points(initial_trajs_tensor, agent_bbx, agent_vel, dt=0.2)
                 collision_evals = collision_evals.cpu().numpy()  # [num_particles, num_traj_tokens]
 
-            for i in range(initial_trajs_np.shape[0]):
+            for i in range(1, initial_trajs_np.shape[0]):  # Start from 1 to skip the 0th trajectory
                 # plot blue for each waypoint that is drivable, red if not
                 traj = initial_trajs_np[i]
                 colors = []
@@ -1709,7 +1745,7 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
 
             
             # Save the figure
-            if self.save_path is not None:
+            if self.should_save_data and self.save_path is not None:
                 save_path = self.save_path / f'bev_traj_{frame:04d}.jpg'
                 plt.savefig(str(save_path), dpi=100)
 
@@ -1862,6 +1898,214 @@ class DriveTransformerAgentDiffusion_Small_MLP_W_ES(autonomous_agent.AutonomousA
             'ego_velocities': np.array(ego_velocities) if len(ego_velocities) > 0 else np.zeros((0, 2)),
             'bbox_corners_ego': bbox_corners_ego
         }
+
+    def get_traffic_lights_info(self, max_distance=50.0, selection_max_distance=30.0):
+        """
+        Get information about all traffic lights and select the best one for ego vehicle.
+        
+        Args:
+            max_distance: Maximum distance to consider for listing all lights (meters)
+            selection_max_distance: Maximum distance for selecting the best light (meters)
+            
+        Returns:
+            dict: {
+                'all_lights': list of dicts, each containing:
+                    'id': traffic light ID
+                    'state': 'Red', 'Yellow', 'Green', 'Off', 'Unknown'
+                    'lateral_distance': lateral offset in ego frame
+                    'forward_distance': distance ahead in ego frame
+                    'dot_product': rotated dot product value
+                    'in_trigger_volume': bool
+                    'is_selected': bool - whether this is the selected traffic light
+                'selected_light': dict or None - the best traffic light for ego vehicle:
+                    'state': str or None
+                    'forward_distance': float or None
+                    'lateral_distance': float or None
+                    'dot_product': float or None
+                    'is_affecting_ego': bool
+            }
+        """
+        import carla
+        
+        def state_to_string(state):
+            if state == carla.TrafficLightState.Red:
+                return 'Red'
+            elif state == carla.TrafficLightState.Yellow:
+                return 'Yellow'
+            elif state == carla.TrafficLightState.Green:
+                return 'Green'
+            elif state == carla.TrafficLightState.Off:
+                return 'Off'
+            else:
+                return 'Unknown'
+        
+        # Get ego vehicle transform and world info
+        gt_transform = self.hero_actor.get_transform()
+        world = self.hero_actor.get_world()
+        ego_forward_vector = gt_transform.get_forward_vector()
+        ego_location = gt_transform.location
+        
+        # Rotate ego forward vector by 90 degrees (around Z-axis) for perpendicular direction
+        ego_forward_rotated_x = -ego_forward_vector.y
+        ego_forward_rotated_y = ego_forward_vector.x
+        ego_forward_rotated_z = ego_forward_vector.z
+        
+        # Transform matrices for ego frame conversion
+        gt_x = gt_transform.location.x
+        gt_y = gt_transform.location.y
+        gt_theta_deg = gt_transform.rotation.yaw
+        gt_theta = -math.radians(gt_theta_deg) + np.pi / 2
+        
+        ego_to_world = np.array([
+            [np.cos(-gt_theta), -np.sin(-gt_theta), gt_x],
+            [np.sin(-gt_theta), np.cos(-gt_theta), gt_y],
+            [0, 0, 1]
+        ])
+        world_to_ego = np.linalg.inv(ego_to_world)
+        
+        # Get all traffic lights
+        all_actors = world.get_actors()
+        all_lights_info = []
+        
+        # For selecting best traffic light
+        best_light_id = None
+        best_dot_product = -float('inf')
+        best_forward_dist = None
+        best_lateral_dist = None
+        best_state = None
+        
+        for traffic_light in all_actors:
+            if 'traffic_light' not in traffic_light.type_id:
+                continue
+            
+            # Get traffic light position
+            tl_transform = traffic_light.get_transform()
+            tl_location = tl_transform.location
+            
+            # Calculate distance
+            distance_to_light = tl_location.distance(ego_location)
+            if distance_to_light > max_distance:
+                continue
+            
+            # Transform to ego frame
+            light_world_pos = np.array([tl_location.x, tl_location.y, 1.0])
+            light_ego_pos = world_to_ego @ light_world_pos
+            ego_pos = light_ego_pos[:2] * np.array([-1, 1])  # [left, forward]
+            lateral_dist = ego_pos[0]
+            forward_dist = ego_pos[1]
+            
+            # Compute rotated dot product
+            tl_forward_vector = tl_transform.get_forward_vector()
+            dot_product = (ego_forward_rotated_x * tl_forward_vector.x + 
+                          ego_forward_rotated_y * tl_forward_vector.y + 
+                          ego_forward_rotated_z * tl_forward_vector.z)
+            
+            # Check if in trigger volume
+            trigger_volume = traffic_light.trigger_volume
+            in_trigger = trigger_volume.contains(ego_location, tl_transform)
+            
+            # Add to all lights list
+            all_lights_info.append({
+                'id': traffic_light.id,
+                'state': state_to_string(traffic_light.get_state()),
+                'lateral_distance': lateral_dist,
+                'forward_distance': forward_dist,
+                'dot_product': dot_product,
+                'in_trigger_volume': in_trigger,
+                'is_selected': False  # Will update this later
+            })
+            
+            # Check if this should be the selected traffic light
+            # Filter 1: Only consider traffic lights in front of ego and within selection distance
+            if forward_dist > 0 and distance_to_light <= selection_max_distance:
+                # Filter 2: Only consider traffic lights with dot product > 0.9 (sufficiently perpendicular)
+                if dot_product > 0.8:
+                    # Filter 3: Select the one with highest rotated dot product
+                    if dot_product > best_dot_product:
+                        best_light_id = traffic_light.id
+                        best_dot_product = dot_product
+                        best_forward_dist = forward_dist
+                        best_lateral_dist = lateral_dist
+                        best_state = state_to_string(traffic_light.get_state())
+        
+        # Mark the selected traffic light
+        for light_info in all_lights_info:
+            if light_info['id'] == best_light_id:
+                light_info['is_selected'] = True
+                break
+        
+        # Prepare selected light result
+        if best_state is not None:
+            print(f"[TL Selected] state={best_state}, forward={best_forward_dist:.1f}m, lateral={best_lateral_dist:.1f}m, rotated_dot={best_dot_product:.3f}", flush=True)
+            selected_light = {
+                'state': best_state,
+                'forward_distance': best_forward_dist,
+                'lateral_distance': best_lateral_dist,
+                'dot_product': best_dot_product,
+                'is_affecting_ego': True
+            }
+        else:
+            print(f"[TL Selected] No traffic light found in front of ego", flush=True)
+            selected_light = {
+                'state': None,
+                'forward_distance': None,
+                'lateral_distance': None,
+                'dot_product': None,
+                'is_affecting_ego': False
+            }
+        
+        return {
+            'all_lights': all_lights_info,
+            'selected_light': selected_light
+        }
+
+    def _get_traffic_light_waypoints(self, traffic_light, carla_map):
+        """
+        Get area of a given traffic light (based on CARLA's official implementation).
+        """
+        def rotate_point(point, angle):
+            x_ = math.cos(math.radians(angle)) * point.x - math.sin(math.radians(angle)) * point.y
+            y_ = math.sin(math.radians(angle)) * point.x + math.cos(math.radians(angle)) * point.y
+            return carla.Vector3D(x_, y_, point.z)
+
+        base_transform = traffic_light.get_transform()
+        base_rot = base_transform.rotation.yaw
+        area_loc = base_transform.transform(traffic_light.trigger_volume.location)
+
+        # Discretize the trigger box into points
+        area_ext = traffic_light.trigger_volume.extent
+        x_values = np.arange(-0.9 * area_ext.x, 0.9 * area_ext.x, 1.0)
+
+        area = []
+        for x in x_values:
+            point = rotate_point(carla.Vector3D(x, 0, area_ext.z), base_rot)
+            point_location = area_loc + carla.Location(x=point.x, y=point.y)
+            area.append(point_location)
+
+        # Get the waypoints of these points, removing duplicates
+        ini_wps = []
+        for pt in area:
+            wpx = carla_map.get_waypoint(pt)
+            if wpx and (not ini_wps or ini_wps[-1].road_id != wpx.road_id or ini_wps[-1].lane_id != wpx.lane_id):
+                ini_wps.append(wpx)
+
+        # Advance them until the intersection
+        wps = []
+        for wpx in ini_wps:
+            if wpx:
+                while not wpx.is_intersection:
+                    next_wp_list = wpx.next(0.5)
+                    if next_wp_list and len(next_wp_list) > 0:
+                        next_wp = next_wp_list[0]
+                        if next_wp and not next_wp.is_intersection:
+                            wpx = next_wp
+                        else:
+                            break
+                    else:
+                        break
+                wps.append(wpx)
+
+        return area_loc, wps
 
     def get_vehicles_info_predicted(self, output_data_batch, score_threshold=0.3):
         """
